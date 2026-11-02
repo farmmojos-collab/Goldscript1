@@ -727,7 +727,7 @@ Settings = {
     GoldVisual = false,
     GoldSpeed = 20.9,
     GoldDelay = 0.75,
-    GoldDetectRange = 13,
+    GoldDetectRange = 14,
     GoldWaitUntilMined = true,
     GoldMaxWait = 20,
     MaxSlopeEnabled = false,
@@ -4084,8 +4084,8 @@ Settings.GoldSpeed = 18
     ASTER.Tabs.Main:AddSlider("Gold Max Wait", 3, 60, 20, 1, function(v)
         Settings.GoldMaxWait = v
     end)
-    Settings.GoldDetectRange = Settings.GoldDetectRange or 13
-    ASTER.Tabs.Main:AddSlider("Gold Detect Range", 5, 80, 13, 1, function(v)
+    Settings.GoldDetectRange = Settings.GoldDetectRange or 14
+    ASTER.Tabs.Main:AddSlider("Gold Detect Range", 5, 80, 14, 1, function(v)
         Settings.GoldDetectRange = v
     end)
     ASTER.Tabs.Main:AddToggle("Visual Waypoints", false, function(v)
