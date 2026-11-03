@@ -1,1977 +1,398 @@
+--[[
+  ASTER Hub (Toby) — 3 scripts en uno, sin ventana de opciones:
+    • Waypoints  (Gold Circuit / waypoints, con la ruta ya cargada)
+    • Boo Lite   (pickup, mine aura, auto eat, farm, craft, campfire, delete)
+    • AutoEquip  (hoe si hay Plant Box cerca, pico si no)
+  Todo arranca solo con la config por defecto. Lo unico visible es la ventana "Toby"
+  (FPS / tiempo / Gold / Bluefruit) con los botones "Seleccionar cofre" y "Start Waypoint".
+]]
 
--- ============================================================
--- CONFIG GENERAL
---   AutoStartRuta : true = al cargar, empieza solo a recorrer la ruta (como tocar "Ruta: ON")
---   AutoStartDelay: segundos de espera antes de arrancar la ruta
--- ============================================================
-ASTER_CONFIG = {
-    AutoStartRuta = true,
-    AutoStartDelay = 6,
-}
+--========================================================================
+-- ASTER HUB (sin ventana): mismas funciones y config, pero sin interfaz.
+-- Cada "pestaña" solo guarda los valores y ejecuta los callbacks.
+--========================================================================
+local Hub = (function()
+    local LP = game:GetService("Players").LocalPlayer
+    local H = { TabList = {}, OnClose = {} }
 
--- ============================================================
--- 0. BASE / HELPERS
--- ============================================================
+    local function guiParent()
+        local ok, ui = pcall(function() return gethui and gethui() end)
+        if ok and ui then return ui end
+        local ok2, core = pcall(function() return game:GetService("CoreGui") end)
+        if ok2 and core then
+            local probe = Instance.new("Folder")
+            local okp = pcall(function() probe.Parent = core end)
+            probe:Destroy()
+            if okp then return core end
+        end
+        return LP:WaitForChild("PlayerGui")
+    end
+
+    H.Parent = guiParent()
+    -- si quedó una ventana vieja de una ejecución anterior, se borra
+    local oldHub = H.Parent:FindFirstChild("AsterHubGui")
+    if oldHub then oldHub:Destroy() end
+
+    function H:Close()
+        for _, fn in ipairs(H.OnClose) do pcall(fn) end
+    end
+
+    function H:CreateTab(name)
+        local Tab = { Options = {}, Registry = {}, Name = name }
+        table.insert(H.TabList, Tab)
+
+        local function safe(cb, ...)
+            if not cb then return end
+            local ok, err = pcall(cb, ...)
+            if not ok then warn("[Hub:" .. name .. "] " .. tostring(err)) end
+        end
+
+        function Tab:AddLabel(text)
+            return { Text = tostring(text) }
+        end
+
+        function Tab:AddToggle(tname, default, cb)
+            local state = default and true or false
+            local reg = {}
+            -- cambia solo el estado (no dispara el callback)
+            function reg.SetValue(a, c)
+                local v = a
+                if type(a) == "table" then v = c end
+                state = v and true or false
+            end
+            function reg.GetValue() return state end
+            -- cambia el estado y ejecuta el callback (como si se tocara el boton)
+            function reg.Fire(v)
+                state = v and true or false
+                safe(cb, state)
+            end
+            Tab.Registry[tname] = reg
+            return reg
+        end
+
+        function Tab:AddSlider(sname, min, max, default, step, cb)
+            local current = tonumber(default) or min
+            local obj = {}
+            function obj:GetValue() return current end
+            function obj:SetValue(v)
+                current = tonumber(v) or current
+                safe(cb, current)
+            end
+            Tab.Registry[sname] = obj
+            return obj
+        end
+
+        function Tab:AddButton(bname, cb)
+            Tab.Registry[bname] = { Fire = function() safe(cb) end }
+        end
+
+        function Tab:AddInput(iname, default, cb)
+            local current = default or ""
+            local obj = {}
+            function obj:GetValue() return current end
+            function obj:SetValue(v)
+                current = v
+                safe(cb, v)
+            end
+            Tab.Registry[iname] = obj
+            return obj
+        end
+
+        function Tab:AddDropdown(dname, values, default, cb)
+            local vals = values or {}
+            local current = default
+            local obj = {}
+            function obj:SetValues(v) vals = v or {} end
+            function obj:SetValue(v)
+                current = v
+                safe(cb, v)
+            end
+            function obj:GetValue() return current end
+            Tab.Registry[dname] = obj
+            return obj
+        end
+
+        return Tab
+    end
+
+    return H
+end)()
+
+local TabWaypoints = Hub:CreateTab("Waypoints")
+local TabBoo = Hub:CreateTab("Boo Lite")
+local TabEquip = Hub:CreateTab("AutoEquip")
+
+
+
+--========================================================================
+-- VENTANA "TOBY": FPS / tiempo / Gold / Bluefruit + botones (cofre y waypoint)
+--========================================================================
+task.spawn(function()
+    local RunService = game:GetService("RunService")
+    local UIS = game:GetService("UserInputService")
+    local startTime = tick()
+
+    local C_BTN = Color3.fromRGB(55, 55, 55)
+    local C_ON = Color3.fromRGB(40, 110, 60)
+
+    local old = Hub.Parent:FindFirstChild("AsterStatsGui")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "AsterStatsGui"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 998
+    sg.Parent = Hub.Parent
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(300, 250)
+    frame.Position = UDim2.new(1, -320, 0, 120)
+    frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+    frame.BackgroundTransparency = 0.1
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = sg
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    -- titulo chico: Toby
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -8, 0, 16)
+    title.Position = UDim2.fromOffset(8, 3)
+    title.BackgroundTransparency = 1
+    title.Text = "Toby"
+    title.TextColor3 = Color3.fromRGB(255, 215, 0)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    -- stats con letra mas grande
+    local body = Instance.new("TextLabel")
+    body.Size = UDim2.new(1, -16, 0, 112)
+    body.Position = UDim2.fromOffset(8, 22)
+    body.BackgroundTransparency = 1
+    body.Text = ""
+    body.TextColor3 = Color3.new(1, 1, 1)
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 22
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Top
+    body.Parent = frame
+
+    local function makeButton(text, y)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -16, 0, 44)
+        b.Position = UDim2.fromOffset(8, y)
+        b.BackgroundColor3 = C_BTN
+        b.BorderSizePixel = 0
+        b.TextColor3 = Color3.new(1, 1, 1)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 19
+        b.Text = text
+        b.Parent = frame
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+        return b
+    end
+    local chestBtn = makeButton("Seleccionar cofre", 140)
+    local startBtn = makeButton("Start Waypoint", 193)
+
+    local function chestReg() return TabBoo.Registry["Select Chest (click chest)"] end
+    local function startReg() return TabWaypoints.Registry["Start Tween"] end
+
+    local function refreshButtons()
+        local c, w = chestReg(), startReg()
+        local choosing = c and c.GetValue()
+        chestBtn.Text = choosing and "Toca un cofre..." or "Seleccionar cofre"
+        chestBtn.BackgroundColor3 = choosing and C_ON or C_BTN
+        local running = w and w.GetValue()
+        startBtn.Text = running and "Stop Waypoint" or "Start Waypoint"
+        startBtn.BackgroundColor3 = running and C_ON or C_BTN
+    end
+
+    -- Seleccionar cofre: activa el modo "elegir cofre", despues toca un Chest / Reinforced Chest
+    chestBtn.Activated:Connect(function()
+        local c = chestReg()
+        if not c then return end
+        c.Fire(not c.GetValue())
+        refreshButtons()
+    end)
+
+    -- Start Waypoint: empieza / detiene el recorrido por la ruta
+    startBtn.Activated:Connect(function()
+        local w = startReg()
+        if not w then return end
+        w.Fire(not w.GetValue())
+        refreshButtons()
+    end)
+
+    -- arrastrar (mouse y touch)
+    local dragging, dragStart, startPos = false, nil, nil
+    frame.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = i.Position
+            startPos = frame.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    local dragConn = UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+
+    -- FPS
+    local frames, fps = 0, 0
+    local fpsConn = RunService.RenderStepped:Connect(function() frames = frames + 1 end)
+
+    local alive = true
+    table.insert(Hub.OnClose, function()
+        alive = false
+        if dragConn then dragConn:Disconnect() end
+        if fpsConn then fpsConn:Disconnect() end
+        sg:Destroy()
+    end)
+
+    local function qty(name)
+        local b = getgenv and getgenv().BooLite
+        if not b or not b.getQuantity then return "-" end
+        local ok, v = pcall(b.getQuantity, name)
+        if ok and v ~= nil then return tostring(v) end
+        return "-"
+    end
+
+    local lastT = tick()
+    while alive do
+        task.wait(0.5)
+        local now = tick()
+        fps = math.floor(frames / math.max(now - lastT, 0.001) + 0.5)
+        frames, lastT = 0, now
+
+        local t = math.floor(now - startTime)
+        body.Text = string.format("FPS: %d\nTiempo: %02d:%02d:%02d\nGold: %s\nBluefruit: %s",
+            fps, math.floor(t / 3600), math.floor(t / 60) % 60, t % 60, qty("Gold"), qty("Bluefruit"))
+        refreshButtons()
+    end
+end)
+
+
+
+--========================================================================
+-- PESTAÑA 1: WAYPOINTS / GOLD CIRCUIT (ASTERWaypoints.lua, sin su UI)
+--========================================================================
+local function loadWaypoints()
+    WaypointUI = TabWaypoints  -- la UI de esta pestaña reemplaza a la de ASTER
+
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 TweenService = game:GetService("TweenService")
 local plr = Players.LocalPlayer
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-Settings = Settings
-Window = Window
-httpservice = game:GetService("HttpService")
-function getAsterEnv()
-    if type(getgenv) == "function" then
-        local ok, env = pcall(getgenv)
-        if ok and type(env) == "table" then
-            return env
-        end
-    end
-    error("[ASTER] getgenv() is required")
-end
-
-local __ASTER_RUNTIME = getAsterEnv().__ASTER_RUNTIME
-if type(__ASTER_RUNTIME) ~= "table" then
-    __ASTER_RUNTIME = { connections = {} }
-    getAsterEnv().__ASTER_RUNTIME = __ASTER_RUNTIME
-elseif type(__ASTER_RUNTIME.connections) ~= "table" then
-    __ASTER_RUNTIME.connections = {}
-end
-__ASTER_RUNTIME.sessionId = (__ASTER_RUNTIME.sessionId or 0) + 1
-local CURRENT_SESSION = __ASTER_RUNTIME.sessionId
-__ASTER_RUNTIME.tribeCacheLoopStarted = false
-__ASTER_RUNTIME.autoDropLoopStarted = false
-__ASTER_RUNTIME.waypointDropdownLoopStarted = false
-__ASTER_RUNTIME.combatTargetLoopStarted = false
-__ASTER_RUNTIME.targetHighlightLoopStarted = false
-__ASTER_RUNTIME.pathFinderRefreshStarted = false
-__ASTER_RUNTIME.silentAimEngineReady = false
-__ASTER_RUNTIME.autoShootLoopStarted = false
-__ASTER_RUNTIME.packetIdAutoSyncStarted = false
-
-function getAsterHiddenUI()
-    if typeof(__ASTER_RUNTIME.hiddenUI) == "Instance" then
-        return __ASTER_RUNTIME.hiddenUI
-    end
-    local ui
-    if type(gethui) == "function" then
-        pcall(function() ui = gethui() end)
-    end
-    if typeof(ui) ~= "Instance" then
-        pcall(function() ui = game:GetService("CoreGui") end)
-    end
-    if typeof(ui) ~= "Instance" then
-        local lp = game:GetService("Players").LocalPlayer
-        ui = lp and (lp:FindFirstChild("PlayerGui") or lp:WaitForChild("PlayerGui", 2))
-    end
-    __ASTER_RUNTIME.hiddenUI = ui
-    return ui
-end
-
-function getWorkspaceResources()
-    local f = workspace:FindFirstChild("Resources")
-    if f then return f end
-    return nil
-end
-
-function isRuntimeSessionActive(session)
-    local rt = getAsterEnv().__ASTER_RUNTIME
-    if type(rt) ~= "table" then return false end
-    return session == rt.sessionId
-end
-
-function autoDiscoverItemID(itemName)
-    if not itemName or itemName == "" then return nil end
-
-    if type(craftNameToID) == "table" then
-        local cached = craftNameToID[itemName]
-        if cached ~= nil then return cached end
-    end
-
-    do
-        local Modules = ReplicatedStorage:FindFirstChild("Modules")
-        if Modules then
-            local ItemIDS = Modules:FindFirstChild("ItemIDS")
-            if ItemIDS and ItemIDS:FindFirstChild(itemName) then
-                local v = ItemIDS[itemName].Value
-                if type(craftNameToID) == "table" then craftNameToID[itemName] = v end
-                if type(craftItemIDs) == "table" then craftItemIDs[v] = itemName end
-                return v
-            end
-        end
-    end
-
-    local inventoryScan = (type(scanInventoryForItemID) == "function") and scanInventoryForItemID or nil
-    local craftScan = (type(scanCraftMenuForItemID) == "function") and scanCraftMenuForItemID or nil
-
-    if inventoryScan then
-        local inventoryID = inventoryScan(itemName)
-        if inventoryID then
-            if type(craftNameToID) == "table" then craftNameToID[itemName] = inventoryID end
-            if type(craftItemIDs) == "table" then craftItemIDs[inventoryID] = itemName end
-            return inventoryID
-        end
-    end
-
-    if craftScan then
-        local craftMenuID = craftScan(itemName)
-        if craftMenuID then
-            if type(craftNameToID) == "table" then craftNameToID[itemName] = craftMenuID end
-            if type(craftItemIDs) == "table" then craftItemIDs[craftMenuID] = itemName end
-            return craftMenuID
-        end
-    end
-
-    return nil
-end
-
--- Canal de paquetes del juego (equipar, comer, tirar, respawn, fuel)
-local ByteNetReliable = ReplicatedStorage:FindFirstChild("ByteNetReliable")
-if not ByteNetReliable then
-    ByteNetReliable = ReplicatedStorage:WaitForChild("ByteNetReliable", 2)
-end
-if not ByteNetReliable then
-    for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
-        if v.Name == "ByteNetReliable" and v:IsA("RemoteEvent") then
-            ByteNetReliable = v
-            break
-        end
-    end
-end
-if not ByteNetReliable then
-    task.spawn(function()
-        local deadline = tick() + 20
-        while not ByteNetReliable and tick() < deadline do
-            local found = ReplicatedStorage:FindFirstChild("ByteNetReliable")
-            if found then
-                ByteNetReliable = found
-                break
-            end
-            task.wait(0.1)
-        end
-        if ByteNetReliable then return end
-        for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
-            if v.Name == "ByteNetReliable" and v:IsA("RemoteEvent") then
-                ByteNetReliable = v
-                break
-            end
-        end
-    end)
-end
-
--- Deployables / PlantBox cache
-function getWorkspaceDeployables()
-    local cached = __ASTER_RUNTIME.deployablesFolder
-    if cached and cached.Parent then
-        return cached
-    end
-    local f = workspace:FindFirstChild("Deployables")
-    if f then
-        __ASTER_RUNTIME.deployablesFolder = f
-        return f
-    end
-    return nil
-end
-
-function getPlantBoxPartCheap(model)
-    if not model then return nil end
-    if model:IsA("BasePart") then return model end
-    local pp = model.PrimaryPart
-    if pp then return pp end
-    return model:FindFirstChildWhichIsA("BasePart")
-end
-
-_plantBoxItemId = nil
-_plantBoxItemIdAt = 0
-
-local function liveIndexDisconnect(prefix)
-    local rt = __ASTER_RUNTIME
-    if type(rt) ~= "table" then return end
-    for _, suffix in ipairs({ "Add", "Rem" }) do
-        local key = prefix .. suffix
-        local conn = rt[key]
-        if conn then
-            pcall(function()
-                if conn.Disconnect then conn:Disconnect() end
-            end)
-            rt[key] = nil
-        end
-    end
-end
-
-local function liveIndexAdd(prefix, inst)
-    local rt = __ASTER_RUNTIME
-    local index, list = rt[prefix .. "Index"], rt[prefix .. "List"]
-    if type(index) ~= "table" or type(list) ~= "table" or not inst or index[inst] then return end
-    local n = #list + 1
-    list[n] = inst
-    index[inst] = n
-    rt[prefix .. "Gen"] = (rt[prefix .. "Gen"] or 0) + 1
-end
-
-local function liveIndexRemove(prefix, inst)
-    local rt = __ASTER_RUNTIME
-    local index, list = rt[prefix .. "Index"], rt[prefix .. "List"]
-    if type(index) ~= "table" or type(list) ~= "table" or not inst then return end
-    local i = index[inst]
-    if not i then return end
-    local n = #list
-    local last = list[n]
-    list[i] = last
-    if last then index[last] = i end
-    list[n] = nil
-    index[inst] = nil
-    rt[prefix .. "Gen"] = (rt[prefix .. "Gen"] or 0) + 1
-end
-
-local function ensureLiveFolderIndex(folder, prefix, matchFn)
-    local rt = __ASTER_RUNTIME
-    if not folder then return nil end
-    if rt[prefix .. "Folder"] == folder and type(rt[prefix .. "List"]) == "table" then
-        return rt[prefix .. "List"]
-    end
-    liveIndexDisconnect(prefix)
-    rt[prefix .. "Folder"] = folder
-    rt[prefix .. "List"] = {}
-    rt[prefix .. "Index"] = {}
-    rt[prefix .. "Gen"] = (rt[prefix .. "Gen"] or 0) + 1
-    rt[prefix .. "Add"] = folder.ChildAdded:Connect(function(ch)
-        if matchFn(ch) then liveIndexAdd(prefix, ch) end
-    end)
-    rt[prefix .. "Rem"] = folder.ChildRemoved:Connect(function(ch)
-        liveIndexRemove(prefix, ch)
-    end)
-    task.spawn(function()
-        local kids = folder:GetChildren()
-        local i = 1
-        local n = #kids
-        while i <= n and rt[prefix .. "Folder"] == folder do
-            local step = 0
-            while step < 50 and i <= n do
-                local ch = kids[i]
-                if matchFn(ch) then liveIndexAdd(prefix, ch) end
-                i = i + 1
-                step = step + 1
-            end
-            task.wait()
-        end
-        table.clear(kids)
-    end)
-    return rt[prefix .. "List"]
-end
-
-function isPlantBoxNameFast(inst)
-    if not inst then return false end
-    local n = inst.Name
-    return n == "Plant Box" or n == "PlantBox"
-end
-
-function getPlantBoxModelsCached()
-    local dep = getWorkspaceDeployables()
-    if not dep then return nil end
-    return ensureLiveFolderIndex(dep, "plantBox", isPlantBoxNameFast)
-end
-
--- Packet IDs (getPacketId / sync)
-PACKET_IDS = {}
-
-_packetDataStatic = { packets = PACKET_IDS }
-
-function getPacketId(packetName)
-    if not packetName or packetName == "" then return nil end
-    local ids = PACKET_IDS or (_packetDataStatic and _packetDataStatic.packets)
-    return ids and ids[packetName] or nil
-end
-
-local PACKET_IDS_CACHE_PATH = "ASTER/sys/c7/f2a91b.dat"
-local PACKET_IDS_CACHE_LEGACY_PATH = "ASTER/Booga/packet_ids.json"
-local PACKET_IDS_CACHE_OBFUSCATE_KEY = "A$t3rPk7_v2"
-local PACKET_IDS_CACHE_META = {
-    lastSync = 0,
-    lastSave = 0,
-    source = "none",
-    changedCount = 0,
-}
-
-local function ensurePacketCacheFolder()
-    if type(makefolder) ~= "function" then return end
-    pcall(function()
-        if type(isfolder) == "function" then
-            if not isfolder("ASTER") then makefolder("ASTER") end
-            if not isfolder("ASTER/sys") then makefolder("ASTER/sys") end
-            if not isfolder("ASTER/sys/c7") then makefolder("ASTER/sys/c7") end
-        else
-            makefolder("ASTER")
-            makefolder("ASTER/sys")
-            makefolder("ASTER/sys/c7")
-        end
-    end)
-end
-
-local function getPacketHttp()
-    return game:GetService("HttpService")
-end
-
-local function xorObfuscateString(text, key)
-    if type(text) ~= "string" or text == "" then return "" end
-    key = key or PACKET_IDS_CACHE_OBFUSCATE_KEY
-    local keyLen = #key
-    if keyLen < 1 then return text end
-    local out = table.create(#text)
-    for i = 1, #text do
-        out[i] = string.char(bit32.bxor(string.byte(text, i), string.byte(key, ((i - 1) % keyLen) + 1)))
-    end
-    return table.concat(out)
-end
-
-local function encodePacketCacheBlob(jsonText)
-    local http = getPacketHttp()
-    local xored = xorObfuscateString(jsonText, PACKET_IDS_CACHE_OBFUSCATE_KEY)
-    local ok, b64 = pcall(function()
-        return http:Base64Encode(xored)
-    end)
-    if ok and type(b64) == "string" then
-        return "AX1:" .. b64
-    end
-
-    return "AX0:" .. xored
-end
-
-local function decodePacketCacheBlob(raw)
-    if type(raw) ~= "string" or raw == "" then return nil end
-    local http = getPacketHttp()
-
-    if string.sub(raw, 1, 4) == "AX1:" then
-        local b64 = string.sub(raw, 5)
-        local ok, decoded = pcall(function()
-            return http:Base64Decode(b64)
-        end)
-        if not ok or type(decoded) ~= "string" then return nil end
-        return xorObfuscateString(decoded, PACKET_IDS_CACHE_OBFUSCATE_KEY)
-    end
-    if string.sub(raw, 1, 4) == "AX0:" then
-        return xorObfuscateString(string.sub(raw, 5), PACKET_IDS_CACHE_OBFUSCATE_KEY)
-    end
-
-    if string.sub(raw, 1, 1) == "{" then
-        return raw
-    end
-    return nil
-end
-
-local function tryHidePacketCacheFile(path)
-
-    pcall(function()
-        if type(sethiddenfile) == "function" then
-            sethiddenfile(path, true)
-            return
-        end
-        if type(isfilehidden) == "function" and type(sethidden) == "function" then
-            sethidden(path, true)
-            return
-        end
-    end)
-end
-
-local function deleteLegacyPacketCache()
-    if type(delfile) ~= "function" or type(isfile) ~= "function" then return end
-    pcall(function()
-        if isfile(PACKET_IDS_CACHE_LEGACY_PATH) then
-            delfile(PACKET_IDS_CACHE_LEGACY_PATH)
-        end
-    end)
-end
-
-local function shallowCopyPacketMap(src)
-    local out = {}
-    if type(src) ~= "table" then return out end
-    for k, v in pairs(src) do
-        if type(k) == "string" and type(v) == "number" and v == v and v > 0 then
-            out[k] = v
-        end
-    end
-    return out
-end
-
-local function packetMapsEqual(a, b)
-    if type(a) ~= "table" or type(b) ~= "table" then return false end
-    for k, v in pairs(a) do
-        if b[k] ~= v then return false end
-    end
-    for k, v in pairs(b) do
-        if a[k] ~= v then return false end
-    end
-    return true
-end
-
-local function diffPacketMaps(oldMap, newMap)
-    local changes = {}
-    oldMap = oldMap or {}
-    newMap = newMap or {}
-    for name, newId in pairs(newMap) do
-        local oldId = oldMap[name]
-        if oldId ~= newId then
-            changes[#changes + 1] = {
-                name = name,
-                oldId = oldId,
-                newId = newId,
-            }
-        end
-    end
-    for name, oldId in pairs(oldMap) do
-        if newMap[name] == nil then
-            changes[#changes + 1] = {
-                name = name,
-                oldId = oldId,
-                newId = nil,
-            }
-        end
-    end
-    return changes
-end
-
-local function decodePacketCacheTable(raw)
-    local jsonText = decodePacketCacheBlob(raw)
-    if not jsonText then return nil end
-    local ok, decoded = pcall(function()
-        return getPacketHttp():JSONDecode(jsonText)
-    end)
-    if not ok or type(decoded) ~= "table" then
-        return nil
-    end
-    local packets = decoded.packets
-    if type(packets) ~= "table" then
-        packets = decoded
-    end
-    local cleaned = shallowCopyPacketMap(packets)
-    if next(cleaned) == nil then
-        return nil
-    end
-    return cleaned, decoded
-end
-
-function loadPacketIdCache()
-    if type(isfile) ~= "function" or type(readfile) ~= "function" then
-        return nil
-    end
-
-    local function tryPath(path)
-        if not isfile(path) then return nil end
-        local ok, raw = pcall(readfile, path)
-        if not ok or type(raw) ~= "string" then return nil end
-        return decodePacketCacheTable(raw)
-    end
-
-    local cleaned, decoded = tryPath(PACKET_IDS_CACHE_PATH)
-    if cleaned then
-
-        deleteLegacyPacketCache()
-        return cleaned, decoded
-    end
-
-    cleaned, decoded = tryPath(PACKET_IDS_CACHE_LEGACY_PATH)
-    if cleaned then
-        deleteLegacyPacketCache()
-        return cleaned, decoded
-    end
-
-    deleteLegacyPacketCache()
-    return nil
-end
-
-function savePacketIdCache(packetMap, meta)
-    if type(writefile) ~= "function" then
-        return false
-    end
-    ensurePacketCacheFolder()
-    local payload = {
-        version = 2,
-        savedAt = os.time(),
-        source = (meta and meta.source) or PACKET_IDS_CACHE_META.source or "live",
-        packets = shallowCopyPacketMap(packetMap or PACKET_IDS),
-    }
-    local ok, jsonText = pcall(function()
-        return getPacketHttp():JSONEncode(payload)
-    end)
-    if not ok or type(jsonText) ~= "string" then
-        return false
-    end
-    local blob = encodePacketCacheBlob(jsonText)
-    local writeOk = pcall(function()
-        writefile(PACKET_IDS_CACHE_PATH, blob)
-    end)
-    if writeOk then
-        PACKET_IDS_CACHE_META.lastSave = os.clock()
-        PACKET_IDS_CACHE_META.source = payload.source
-        tryHidePacketCacheFile(PACKET_IDS_CACHE_PATH)
-        deleteLegacyPacketCache()
-    end
-    return writeOk
-end
-
-local function applyPacketMap(packetMap, source)
-    if type(packetMap) ~= "table" then return 0 end
-    local applied = 0
-    for name, id in pairs(packetMap) do
-        if type(name) == "string" and type(id) == "number" and id == id and id > 0 then
-            if PACKET_IDS[name] ~= id then
-                PACKET_IDS[name] = id
-                applied = applied + 1
-            elseif PACKET_IDS[name] == nil then
-                PACKET_IDS[name] = id
-                applied = applied + 1
-            end
-        end
-    end
-    if source then
-        PACKET_IDS_CACHE_META.source = source
-    end
-    return applied
-end
-
-local function readPacketObjectId(packetObj)
-    if type(packetObj) ~= "table" then return nil end
-    for _, key in ipairs({ "id", "Id", "_id", "packetId", "packetID", "ID" }) do
-        local v = packetObj[key]
-        if type(v) == "number" and v == v and v > 0 then
-            return v
-        end
-    end
-    return nil
-end
-
-local function tryRequirePacketIDs(modulesFolder)
-    local candidates = {}
-    local function add(inst)
-        if inst then
-            table.insert(candidates, inst)
-        end
-    end
-
-    local byteNet = modulesFolder:FindFirstChild("ByteNet")
-    if byteNet then
-        local packetsFolder = byteNet:FindFirstChild("packets")
-        if packetsFolder then
-            add(packetsFolder:FindFirstChild("packetIDs"))
-            add(packetsFolder:FindFirstChild("packetIds"))
-            add(packetsFolder:FindFirstChild("PacketIDs"))
-        end
-        add(byteNet:FindFirstChild("packetIDs"))
-        add(byteNet:FindFirstChild("packetIds"))
-    end
-    add(modulesFolder:FindFirstChild("packetIDs"))
-    add(modulesFolder:FindFirstChild("packetIds"))
-
-    for _, inst in ipairs(candidates) do
-        local ok, result = pcall(require, inst)
-        if ok and type(result) == "table" then
-            return result, inst:GetFullName()
-        end
-    end
-    return nil, nil
-end
-
-local function discoverLivePacketMap()
-    local modulesFolder = ReplicatedStorage:FindFirstChild("Modules")
-        or ReplicatedStorage:WaitForChild("Modules", 10)
-    if not modulesFolder then
-        return nil, "Modules missing"
-    end
-
-    local packetsInst = modulesFolder:FindFirstChild("Packets")
-        or modulesFolder:WaitForChild("Packets", 10)
-    if not packetsInst then
-        return nil, "Packets missing"
-    end
-
-    local okPackets, gamePackets = pcall(require, packetsInst)
-    if not okPackets or type(gamePackets) ~= "table" then
-        return nil, "Packets require failed"
-    end
-
-    local live = {}
-    local packetIDs = tryRequirePacketIDs(modulesFolder)
-    local resolved = {}
-
-    local function applyId(name, id)
-        if type(name) ~= "string" or name == "" then return end
-        if type(id) ~= "number" or id ~= id or id <= 0 then return end
-        if resolved[name] then return end
-        resolved[name] = true
-        live[name] = id
-    end
-
-    for name, packetObj in pairs(gamePackets) do
-        local id = readPacketObjectId(packetObj)
-        if id then
-            applyId(name, id)
-        end
-    end
-
-    if type(packetIDs) == "table" then
-        for name, packetObj in pairs(gamePackets) do
-            if type(packetObj) == "table" and not resolved[name] then
-                for id, registeredPacket in pairs(packetIDs) do
-                    if type(id) == "number" and registeredPacket == packetObj then
-                        applyId(name, id)
-                        break
-                    end
-                end
-            end
-        end
-        for id, registeredPacket in ipairs(packetIDs) do
-            if type(registeredPacket) == "table" then
-                for name, packetObj in pairs(gamePackets) do
-                    if packetObj == registeredPacket then
-                        applyId(name, id)
-                        break
-                    end
-                end
-            end
-        end
-    end
-
-    if next(live) == nil then
-        return nil, "No live packet IDs resolved"
-    end
-    return live, nil
-end
-
-function syncPacketIDs(opts)
-    opts = opts or {}
-    local silent = opts.silent == true
-    local forceSave = opts.forceSave == true
-
-    local before = shallowCopyPacketMap(PACKET_IDS)
-    local cacheMap = loadPacketIdCache()
-
-    if opts.loadCache ~= false and cacheMap then
-        applyPacketMap(cacheMap, "cache")
-    end
-
-    local liveMap, liveErr = discoverLivePacketMap()
-    PACKET_IDS_CACHE_META.lastSync = os.clock()
-
-    if not liveMap then
-        if not silent then
-            warn("[ASTER Packets] Live lookup failed:", liveErr or "unknown", "- using cache only")
-        end
-        if forceSave or (not cacheMap and next(PACKET_IDS) ~= nil) then
-            savePacketIdCache(PACKET_IDS, { source = cacheMap and "cache" or "partial" })
-        end
-        return false, liveErr
-    end
-
-    local changes = diffPacketMaps(before, liveMap)
-
-    local cacheChanges = diffPacketMaps(cacheMap or {}, liveMap)
-    applyPacketMap(liveMap, "live")
-
-    local shouldSave = forceSave or not cacheMap or not packetMapsEqual(cacheMap, liveMap)
-    if shouldSave then
-        savePacketIdCache(liveMap, { source = "live" })
-        PACKET_IDS_CACHE_META.changedCount = #cacheChanges
-    end
-
-    return true, changes
-end
-
-function startPacketIdAutoSync(intervalSec)
-    intervalSec = tonumber(intervalSec) or 30
-    if intervalSec < 5 then intervalSec = 5 end
-    local runtime = getAsterEnv and getAsterEnv().__ASTER_RUNTIME
-    if type(runtime) == "table" then
-        if runtime.packetIdAutoSyncStarted then return end
-        runtime.packetIdAutoSyncStarted = true
-    end
-    task.spawn(function()
-        local session = CURRENT_SESSION
-
-        pcall(function()
-            syncPacketIDs({ loadCache = true, silent = false })
-        end)
-        while true do
-            if CURRENT_SESSION ~= session then
-                break
-            end
-            task.wait(intervalSec)
-            if CURRENT_SESSION ~= session then
-                break
-            end
-            pcall(function()
-                syncPacketIDs({ loadCache = false, silent = true })
-            end)
-        end
-        if type(runtime) == "table" and CURRENT_SESSION ~= session then
-            runtime.packetIdAutoSyncStarted = false
-        end
-    end)
-end
-
-task.spawn(function()
-    startPacketIdAutoSync(30)
-end)
-
--- ============================================================
--- 1. SETTINGS
--- ============================================================
-Settings = {
-
-    GoldCircuitEnabled = false,
-    GoldAutoEquip = false,
-    GoldHoeType = "Wood Hoe",
-    recordedPositions = {},
-    recordingPath = false,
-    recordInterval = 1.0,
-    GoldNoclip = false,
-    GoldVisual = false,
-    GoldSpeed = 20.9,
-    GoldDelay = 0.75,
-    GoldDetectRange = 14,
-    GoldWaitUntilMined = true,
-    GoldMaxWait = 20,
-    MaxSlopeEnabled = false,
-    WaterTweenEnabled = false,
-
-    HealCPS = 80,
-    AutoEatEnabled = false,
-    EatThreshold = 99,
-    EatFruit = "Bloodfruit",
-    WasteFruit = "Bloodfruit",
-    FruitsCapAmount = 100,
-    WasteFruitsEnabled = false,
-    EatCap = 100,
-    EatCapEnabled = false,
-
-    AutoDropEnabled = false,
-    DropItem = "",
-    DropAmount = "Infinite",
-    PickupRange = 50,
-    PickupDelay = 0.01,
-
-    AutoFuelEnabled = false,
-    FuelType = "All (Wood/Log/Leaves)",
-    FuelThreshold = 200,
-
-    TweenToPlantBox = false,
-    TweenToBush = false,
-    TweenToBushAndBox = false,
-
-    AutoRespawnEnabled = false,
-
-    recordInterval = 1.0,
-    maxWalkAttemptTime = 2,
-    WalkSpeedEnabled = false,
-    WalkSpeed = 16,
-    HipHeight = 2,
-
-    GoldNoclip = false,
-    GoldCircuitEnabled = false,
-    GoldVisual = false,
-    GoldDelay = 0.75,
-    WaterTweenEnabled = false,
-    recordedPositions = {},
-    GoldSpeed = 21,
-}
-
--- ============================================================
--- 2. PERSONAJE / COLISIONES / RAYCAST (usado por Gold & Paths)
--- ============================================================
-
-rs = ReplicatedStorage
-char = plr.Character
-root = char and char:FindFirstChild("HumanoidRootPart")
-hum = char and char:FindFirstChild("Humanoid")
 runs = game:GetService("RunService")
 httpservice = game:GetService("HttpService")
 
-originalCollision = originalCollision or {}
-function captureCollisionState()
-    originalCollision = {}
-    if plr.Character then
-        for _, part in pairs(plr.Character:GetDescendants()) do
-            if part:IsA("BasePart") then
-                originalCollision[part] = part.CanCollide
+-- ===== Dependencias (copiadas del script original; solo se crean si no existen) =====
+if type(isRuntimeSessionActive) ~= "function" then
+    function getAsterEnv()
+        if type(getgenv) == "function" then
+            local ok, env = pcall(getgenv)
+            if ok and type(env) == "table" then
+                return env
             end
         end
+        error("[ASTER] getgenv() is required")
     end
-end
 
-function resetCharacterPhysics()
-    local character = plr.Character
-    if not character then return end
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    if hrp then
-        local cbv = hrp:FindFirstChild("CircuitBodyVelocity")
-        if cbv then cbv:Destroy() end
-        local pbg = hrp:FindFirstChild("CircuitBodyGyro")
-        if pbg then pbg:Destroy() end
-        local pbv = hrp:FindFirstChild("PlantBodyVelocity")
-        if pbv then pbv:Destroy() end
-        local pgy = hrp:FindFirstChild("PlantBodyGyro")
-        if pgy then pgy:Destroy() end
-        hrp.Velocity = Vector3.new(0,0,0)
-        hrp.RotVelocity = Vector3.new(0,0,0)
+    __ASTER_RUNTIME = getAsterEnv().__ASTER_RUNTIME
+    if type(__ASTER_RUNTIME) ~= "table" then
+        __ASTER_RUNTIME = { connections = {} }
+        getAsterEnv().__ASTER_RUNTIME = __ASTER_RUNTIME
+    elseif type(__ASTER_RUNTIME.connections) ~= "table" then
+        __ASTER_RUNTIME.connections = {}
     end
-end
+    -- Bump session on each execution so stale background loops exit after reinject.
+    __ASTER_RUNTIME.sessionId = (__ASTER_RUNTIME.sessionId or 0) + 1
+    CURRENT_SESSION = __ASTER_RUNTIME.sessionId
+    __ASTER_RUNTIME.waypointDropdownLoopStarted = false
 
-if char then
-    resetCharacterPhysics()
-    captureCollisionState()
-end
+    function isRuntimeSessionActive(session)
+        local rt = getAsterEnv().__ASTER_RUNTIME
+        if type(rt) ~= "table" then return false end
+        return session == rt.sessionId
+    end
 
-function onCharacterAdded(newChar)
-    char = newChar
-    root = char:WaitForChild("HumanoidRootPart")
-    hum = char:WaitForChild("Humanoid")
-    if hum then hum.MaxSlopeAngle = Settings.MaxSlopeEnabled and 89 or 50 end
-    captureCollisionState()
-end
-
-plr.CharacterAdded:Connect(onCharacterAdded)
-
-function getlayout(name)
-    if not name or name == "" then return nil end
-    local mainGui = plr.PlayerGui:FindFirstChild("MainGui")
-    if not mainGui then return nil end
-    local right = mainGui:FindFirstChild("RightPanel")
-    local inv = right and right:FindFirstChild("Inventory")
-    local list = inv and inv:FindFirstChild("List")
-    if not list then return nil end
-    local lowerTarget = string.lower((tostring(name):match("^%s*(.-)%s*$") or ""))
-    if lowerTarget == "" then return nil end
-    for _, child in ipairs(list:GetChildren()) do
-        if child:IsA("GuiObject") then
-            local cn = string.lower((tostring(child.Name):match("^%s*(.-)%s*$") or ""))
-            if cn == lowerTarget then
-                return child.LayoutOrder
-            end
+    function trackConnection(key, conn)
+        local rt = getAsterEnv().__ASTER_RUNTIME
+        if type(rt) ~= "table" then
+            return conn
         end
-    end
-    return nil
-end
-
-isTweening = false
-
-rayParams = RaycastParams.new()
-
-function updateRayParams()
-    if plr.Character then rayParams.FilterDescendantsInstances = {plr.Character} end
-end
-
-plr.CharacterAdded:Connect(updateRayParams)
-
-if plr.Character then updateRayParams() end
-
-maxWalkAttemptTime = 3
-
--- ============================================================
--- 3. HEAL FRUITS / INVENTORY SCAN
--- ============================================================
-craftItemIDs = craftItemIDs or {}
-craftNameToID = craftNameToID or {}
-
--- Tabla nombre <-> ID de items (desde el modulo ItemIDS del juego)
-do
-    local itemIdModuleObj = ReplicatedStorage:FindFirstChild("Modules")
-        and ReplicatedStorage.Modules:FindFirstChild("ItemIDS")
-
-    local ok, ItemIDSModule = pcall(function()
-        if itemIdModuleObj then
-            return require(itemIdModuleObj)
+        if type(rt.connections) ~= "table" then
+            rt.connections = {}
         end
-        return require(ReplicatedStorage:WaitForChild("Modules", 2):WaitForChild("ItemIDS", 2))
-    end)
-
-    if not ok or type(ItemIDSModule) ~= "table" then
-        ItemIDSModule = {}
+        local old = rt.connections[key]
+        if old and old.Disconnect then
+            pcall(function() old:Disconnect() end)
+        end
+        rt.connections[key] = conn
+        return conn
     end
 
-    local isNameToID = false
-    for k, v in pairs(ItemIDSModule) do
-        if type(k) == "string" and type(v) == "number" then
-            isNameToID = true
-            break
-        end
+    -- Canonical world folders (Booga workspace layout).
+    function getWorkspaceResources()
+        local f = workspace:FindFirstChild("Resources")
+        if f then return f end
+        return nil
+    end
+    function getWorkspaceDeployables()
+        local f = workspace:FindFirstChild("Deployables")
+        if f then return f end
+        return nil
     end
 
-    if isNameToID then
-        for name, id in pairs(ItemIDSModule) do
-            craftNameToID[name] = id
-            craftItemIDs[id] = name
-        end
-    else
-        for id, name in pairs(ItemIDSModule) do
-            craftItemIDs[id] = name
-            craftNameToID[name] = id
-        end
-    end
-end
-function scanInventoryForItemID(itemName)
-    local mainGui = plr.PlayerGui:FindFirstChild("MainGui")
-    if not mainGui then return nil end
-    local rightPanel = mainGui:FindFirstChild("RightPanel")
-    if not rightPanel then return nil end
-    local invFrame = rightPanel:FindFirstChild("Inventory")
-    if not invFrame then return nil end
-    local inventory = invFrame:FindFirstChild("List")
-    if not inventory then return nil end
-    for _, item in ipairs(inventory:GetChildren()) do
-        if item:IsA("ImageLabel") and item.Name == itemName then
-            local itemID = item:GetAttribute("ItemID") or item:GetAttribute("itemID")
-            if not itemID then
-                for _, child in ipairs(item:GetChildren()) do
-                    if child:IsA("IntValue") or child:IsA("NumberValue") then
-                        itemID = child.Value
-                        break
-                    end
-                end
-            end
-            return itemID
-        end
-    end
-    return nil
-end
-
-function scanCraftMenuForItemID(itemName)
-    local mainGui = plr.PlayerGui:FindFirstChild("MainGui")
-    if not mainGui then return nil end
-    local leftPanel = mainGui:FindFirstChild("LeftPanel")
-    local craftMenuPaths = {
-        mainGui:FindFirstChild("CraftingMenu"),
-        mainGui:FindFirstChild("Crafting"),
-        mainGui:FindFirstChild("Craft"),
-        leftPanel and leftPanel:FindFirstChild("Crafting") or nil,
-    }
-    for _, menu in ipairs(craftMenuPaths) do
-        if menu then
-            for _, item in ipairs(menu:GetDescendants()) do
-                if item:IsA("TextLabel") or item:IsA("TextButton") then
-                    if item.Text == itemName or item.Name == itemName then
-                        local parent = item.Parent
-                        local itemID = parent and (parent:GetAttribute("ItemID") or parent:GetAttribute("itemID") or parent:GetAttribute("ID")) or nil
-                        if itemID then return itemID end
-                    end
+    originalCollision = originalCollision or {}
+    function captureCollisionState()
+        originalCollision = {}
+        if plr.Character then
+            for _, part in pairs(plr.Character:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    originalCollision[part] = part.CanCollide
                 end
             end
         end
     end
-    return nil
+    if plr.Character then captureCollisionState() end
+    plr.CharacterAdded:Connect(function() task.wait(1) captureCollisionState() end)
+
+    -- Settings usados por este modulo (valores iniciales)
+    Settings = Settings or {}
+    Settings.GoldCircuitEnabled = Settings.GoldCircuitEnabled or false
+    Settings.recordedPositions = Settings.recordedPositions or {}
+    Settings.recordingPath = Settings.recordingPath or false
+    Settings.recordInterval = Settings.recordInterval or 1.0
+    Settings.GoldNoclip = Settings.GoldNoclip or false
+    Settings.GoldVisual = Settings.GoldVisual or false
+    Settings.GoldSpeed = Settings.GoldSpeed or 19
+    if Settings.GoldDelay == nil then Settings.GoldDelay = 0 end
+    if Settings.GoldWaitUntilMined == nil then Settings.GoldWaitUntilMined = true end
+    Settings.GoldMaxWait = Settings.GoldMaxWait or 20
+    Settings.WaterTweenEnabled = Settings.WaterTweenEnabled or false
 end
 
-ALL_HEAL_FRUIT_NAMES = ALL_HEAL_FRUIT_NAMES or {
-    "Apple", "Banana", "Barley", "Berry", "Bloodfruit", "Bluefruit", "Blossom",
-    "Carrot", "Cloudberry", "Coconut", "Corn", "Cooked Meat", "Frostfruit",
-    "Jelly", "Lemon", "Mango", "Oddberry", "Orange", "Prickly Pear", "Pumpkin",
-    "Strangefruit", "Strawberry", "Sunfruit", "Watermelon",
-}
+-- ===== Gold Detect Range y dependencias (valores por defecto) =====
+Settings = Settings or {}
+Settings.GoldDetectRange = tonumber(Settings.GoldDetectRange) or 14
+if Settings.GoldWaitUntilMined == nil then Settings.GoldWaitUntilMined = true end
+Settings.GoldMaxWait = tonumber(Settings.GoldMaxWait) or 20
 
-fruittoitemid = {}
-
-for _, fruitName in ipairs(ALL_HEAL_FRUIT_NAMES) do
-    local id = autoDiscoverItemID(fruitName)
-    if id == nil and craftNameToID then
-        id = craftNameToID[fruitName]
-    end
-    fruittoitemid[fruitName] = (id ~= nil) and id or false
-end
-
-if craftNameToID then
-    for name, _ in pairs(fruittoitemid) do
-        if craftNameToID[name] then
-            fruittoitemid[name] = craftNameToID[name]
-        end
-    end
-end
-
-do
-    local _fuelMap = {
-        ["Wood"] = autoDiscoverItemID("Wood"),
-        ["Log"] = autoDiscoverItemID("Log"),
-        ["Leaves"] = autoDiscoverItemID("Leaves"),
-        ["Coal"] = autoDiscoverItemID("Coal"),
-    }
-
-    getAsterEnv()["fueltoitemid"] = _fuelMap
-    fueltoitemid = _fuelMap
-    fueltoitemid = _fuelMap
-
-    if craftNameToID then
-        for name, _ in pairs(_fuelMap) do
-            if craftNameToID[name] then
-                _fuelMap[name] = craftNameToID[name]
-            end
-        end
-    end
-end
-
-healFruitData = fruittoitemid
-
-TweenService = game:GetService("TweenService")
-
--- ============================================================
--- 4. GOLD AUTOTOOL EQUIP + SELECT HOE
--- ============================================================
-do
-function getToolSlot(toolName)
-    local GameUtil = nil
-    pcall(function() GameUtil = require(game:GetService("ReplicatedStorage").Modules.GameUtil) end)
-    if not GameUtil then return nil end
-    local toolbar = GameUtil.Data.toolbar
-    if not toolbar then return nil end
-    for i = 1, 6 do
-        if toolbar[i] and toolbar[i].name == toolName then
-            return i
-        end
-    end
-    return nil
-end
-
-function equipItemPacket(name)
-     if ByteNetReliable then
-         local slot = getToolSlot(name)
-         if slot then
-             local equipPacketId = getPacketId("EquipTool")
-             if not equipPacketId then return end
-             local b = buffer.create(4)
-             buffer.writeu8(b, 0, 0)
-             buffer.writeu8(b, 1, equipPacketId)
-             buffer.writeu16(b, 2, slot)
-             ByteNetReliable:FireServer(b)
-         else
-             if plr.Character then
-                 local tool = plr.Backpack:FindFirstChild(name)
-                 if tool then plr.Character.Humanoid:EquipTool(tool) end
-             end
-         end
-     else
-         if plr.Character then
-             local tool = plr.Backpack:FindFirstChild(name)
-             if tool then plr.Character.Humanoid:EquipTool(tool) end
-         end
-     end
-end
-
-function isToolEquipped(toolName)
-    local playersFolder = workspace:FindFirstChild("Players")
-    if playersFolder then
-        local plrFolder = playersFolder:FindFirstChild(plr.Name)
-        if plrFolder then
-            local toolsFolder = plrFolder:FindFirstChild("Tools")
-            if toolsFolder and toolsFolder:FindFirstChild(toolName) then
-                return true
-            end
-        end
-    end
-    if plr.Character and plr.Character:FindFirstChild(toolName) then
-        return true
-    end
-    return false
-end
-
-local goldEquipActive = false
-
-local function findNearbyPlantBox(hrp, range)
-    range = range or 25
-    if not hrp then return false end
-    local rangeSq = range * range
-    local hrpPos = hrp.Position
-    local boxes = getPlantBoxModelsCached()
-    if boxes then
-        for i = 1, #boxes do
-            local model = boxes[i]
-            if model and model.Parent then
-                local part = getPlantBoxPartCheap(model)
-                if part then
-                    local d = hrpPos - part.Position
-                    if (d.X * d.X + d.Y * d.Y + d.Z * d.Z) <= rangeSq then
-                        return true
-                    end
-                end
-            end
-        end
-    end
-    return false
-end
-
-function startGoldEquipManager()
-    if goldEquipActive then return end
-    if not Settings.GoldAutoEquip then return end
-    goldEquipActive = true
-    task.spawn(function()
-        local HOE_RANGE = 30
-        while Settings.GoldAutoEquip and not ScriptKilled do
-            pcall(function()
-                local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-                if not hrp then return end
-
-                local nearby = findNearbyPlantBox(hrp, HOE_RANGE)
-                if nearby then
-                    local hoeName = Settings.GoldHoeType or "Wood Hoe"
-                    if not isToolEquipped(hoeName) then
-                        equipItemPacket(hoeName)
-                        task.wait(0.35)
-                    end
-                else
-                    local pickName = "God Pick"
-                    if not isToolEquipped(pickName) then
-                        equipItemPacket(pickName)
-                        task.wait(0.35)
-                    end
-                end
-            end)
-            task.wait(0.4)
-        end
-        goldEquipActive = false
-    end)
-end
-
-end
-
--- ============================================================
--- 5. MINE AURA
--- ============================================================
-task.spawn(function()
-
-local CONFIG = {
-	Range = 18,
-	ScanScale = 3.5,
-	MaxTargets = 2,
-	SwingDelay = 0.02,
-	StartEnabled = true,
-	Targets = { "Critters", "Resources" },
-	FaceTarget = false,
-	SwingAnimation = false,
-	Toggle = Enum.KeyCode.X,
-}
-
-if not game:IsLoaded() then game.Loaded:Wait() end
-
-local cloneref = cloneref or function(x) return x end
-local Players = cloneref(game:GetService("Players"))
-local RS = cloneref(game:GetService("ReplicatedStorage"))
-local RunService = cloneref(game:GetService("RunService"))
-local UIS = cloneref(game:GetService("UserInputService"))
-local CollectionService = cloneref(game:GetService("CollectionService"))
-
-if getgenv().MineAuraStop then getgenv().MineAuraStop() end
-
-repeat task.wait() until RS:FindFirstChild("GameLoaded")
-
-local lp = Players.LocalPlayer
-local gameFolder = RS:WaitForChild("Game")
-local Packets = require(RS.Modules.Packets)
-local GameUtil = require(RS.Modules.GameUtil)
-local ItemData = require(RS.Modules.ItemData)
-local Clock = require(RS.Modules.Clock)
-local animations = require(gameFolder.animations)
-local statusEffects = require(gameFolder.classes.statusEffects)
-
-local toolTypes = {}
-for _, m in ipairs(gameFolder:WaitForChild("tool"):GetChildren()) do
-	local ok, mod = pcall(require, m)
-	if ok then toolTypes[m.Name] = mod end
-end
-
-local weapons = { "Rock", "War Hammer", "Mace", "Club", "Battle Axe", "Crystal Stick", "God Rock", "Emerald Blade" }
-
-local enabled = false
-local lastSwing = 0
-local lastScan = 0
-local valid, checked = {}, {}
-local isPlayingHit = false
-local hitAnim1, hitAnim2
-
-local function char() return lp.Character end
-local function hrp() local c = char() return c and c:FindFirstChild("HumanoidRootPart") end
-
-local function firepacket(name, ...)
-	if not Packets[name] then return false end
-	local ok, err = pcall(Packets[name].send, ...)
-	if not ok then warn("packet failed:", name, err) end
-	return ok
-end
-
-local function wants(name)
-	return table.find(CONFIG.Targets, name) ~= nil
-end
-
-local function getTool()
-	local c = char()
-	if not c then return nil end
-	local tools = c:FindFirstChild("Tools")
-	if not tools then return nil end
-	for _, t in ipairs(tools:GetChildren()) do
-		if t:IsA("Model") and (table.find(weapons, t.Name) or t.Name:find("Axe") or t.Name:find("Pick")) then
-			return t
-		end
-	end
-end
-
-local function scan()
-	table.clear(valid)
-	table.clear(checked)
-	local c, root = char(), hrp()
-	if not c or not root then return end
-
-	local params = OverlapParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local ignore = { c, workspace.Players, workspace.Terrain, workspace.Items }
-	for _, o in ipairs(CollectionService:GetTagged("Contents")) do table.insert(ignore, o) end
-	params.FilterDescendantsInstances = ignore
-
-	local s = CONFIG.Range * CONFIG.ScanScale
-	local parts = workspace:GetPartBoundsInBox(c:GetPivot(), Vector3.new(s, s, s), params)
-
-	for _, part in ipairs(parts) do
-		local model = part:FindFirstAncestorWhichIsA("Model")
-		if model and not checked[model] and model.Parent then
-			local ok = false
-			if wants("Resources") then
-				local n = model.Name
-				ok = model.Parent == workspace.Resources or model.Parent == workspace.Mounds
-					or n == "Gold Node" or n == "Iron Node" or n == "Coal Node" or n == "Meteor Core"
-					or n == "Crystal Meteor Core" or n == "Crystal Meteor Rock" or n == "Magnetite Meteor Rock"
-					or n == "Small Rock" or n == "Meteor Rock"
-			end
-			if not ok and wants("Critters") then ok = model.Parent == workspace.Critters end
-			if not ok and wants("Deployables") then ok = model.Parent == workspace.Deployables end
-			if not ok and wants("Rubble") then ok = model.Parent == workspace.Rubble end
-			if ok then
-				checked[model] = true
-				valid[#valid + 1] = model
-			end
-		end
-	end
-end
-
-local function nearest()
-	local root = hrp()
-	if not root then return end
-	local best, bestDist = nil, CONFIG.Range
-	for _, m in ipairs(valid) do
-		if m and m.Parent then
-			local d = (m:GetPivot().Position - root.Position).Magnitude
-			if d <= bestDist then best, bestDist = m, d end
-		end
-	end
-	return best
-end
-
-local function playSwing()
-	task.spawn(function()
-		local data = ItemData[GameUtil.Data.toolbar[GameUtil.Data.equipped].name]
-		if not data or not data.useType or not toolTypes[data.useType] then return end
-		animations.stopCustomAnimations()
-		local speed = data.speed
-		if not speed then return end
-		if statusEffects.playerHasEffect("Haste") and (data.toolType == "Axe" or data.toolType == "Pick") then
-			speed -= speed * 0.1
-		end
-		local now = Clock.getServerTime(true)
-		if speed <= now - GameUtil.Data.lastToolUse then
-			GameUtil.Data.lastToolUse = now
-			if isPlayingHit then
-				if hitAnim1 then hitAnim1:Stop() hitAnim1 = nil end
-				isPlayingHit = false
-				hitAnim2 = animations.playAnimation("LSlash")
-			else
-				if hitAnim2 then hitAnim2:Stop() hitAnim2 = nil end
-				isPlayingHit = true
-				hitAnim1 = animations.playAnimation("Slash")
-			end
-		end
-	end)
-end
-
-local function swing(target)
-	if tick() - lastSwing < CONFIG.SwingDelay then return end
-	if CONFIG.SwingAnimation then playSwing() end
-
-	local ids, seen = {}, {}
-	local function add(model)
-		if not model or not model.Parent then return end
-		local id = model:GetAttribute("EntityID")
-		if not id then
-			for _, d in ipairs(model:GetDescendants()) do
-				id = d:GetAttribute("EntityID")
-				if id then break end
-			end
-		end
-		if id and not seen[id] then
-			seen[id] = true
-			ids[#ids + 1] = { entityID = id }
-		end
-	end
-
-	local root = hrp()
-	local list = {}
-	for _, m in ipairs(valid) do
-		if m and m.Parent then
-			list[#list + 1] = { m = m, d = (m:GetPivot().Position - root.Position).Magnitude }
-		end
-	end
-	table.sort(list, function(a, b) return a.d < b.d end)
-	for i = 1, math.min(CONFIG.MaxTargets, #list) do
-		add(list[i].m)
-	end
-	if #ids == 0 then return end
-
-	lastSwing = tick()
-	firepacket("SwingTool", {
-		entityIDs = ids,
-		cframe = char():GetPivot(),
-		timestamp = Clock.getServerTime(true),
-	})
-end
-
-local conn = RunService.Heartbeat:Connect(function()
-	if not enabled then return end
-	local c, root = char(), hrp()
-	if not c or not root then return end
-	local hum = c:FindFirstChildOfClass("Humanoid")
-	if not hum or hum.Health <= 0 then return end
-	if not lp:GetAttribute("hasSpawned") then return end
-	if not getTool() then return end
-
-	if tick() - lastScan >= 0.1 then
-		lastScan = tick()
-		scan()
-	end
-
-	local target = nearest()
-	if not target then return end
-
-	if CONFIG.FaceTarget then
-		local p = target:GetPivot().Position
-		c:PivotTo(CFrame.lookAt(root.Position, Vector3.new(p.X, root.Position.Y, p.Z)))
-	end
-	swing(target)
-end)
-
-local function setEnabled(v)
-	enabled = v
-	__ASTER_RUNTIME.MineAuraEnabled = v
-
-	pcall(function()
-		local reg = Window.ElementRegistry["Mine Aura"]
-		if reg and reg.SetValue then reg.SetValue(v) end
-	end)
-end
-__ASTER_RUNTIME.MineAuraSet = setEnabled
-
-local startValue = __ASTER_RUNTIME.MineAuraEnabled
-if startValue == nil then startValue = CONFIG.StartEnabled end
-setEnabled(startValue)
-
-local keyConn = UIS.InputBegan:Connect(function(input, gp)
-	if gp then return end
-	if input.KeyCode == CONFIG.Toggle then setEnabled(not enabled) end
-end)
-
-getgenv().MineAuraStop = function()
-	enabled = false
-	conn:Disconnect()
-	keyConn:Disconnect()
-	__ASTER_RUNTIME.MineAuraSet = nil
-	getgenv().MineAuraStop = nil
-end
-end)
-
--- ============================================================
--- 6. FARM
--- ============================================================
-__ASTER_RUNTIME.FarmLists = {
-	FRUITS = { "Berry","Oddberry","Cloudberry","Bluefruit","Bloodfruit","Strawberry","Sunfruit","Strangefruit","Petrified Berry","Jelly","Frostfruit","Blossom","Banana","Apple","Lemon","Orange","Mango","Watermelon","Pumpkin","Pumpkins","Prickly Pear","Carrot","Carrots","Corn","Barley","Coconut" },
-	ITEMS = { "All","Essence","Coin","Coin2","Coin Stack","Wood","Stone","Coal","Iron","Gold","Adurite","Magnetite","Emerald","Pink Diamond","Obsidian","Crystal Chunk","Spirit Key","Void Shard","Hide","Fire Hide","Leaves","Log","Sand","Glass","Scute","Lead","Cogs","Ice Cube","Raw Gold","Raw Iron","Raw Adurite","Raw Emerald","Raw Magnetite","Raw Pink Diamond","Steel","Steel Mix","Berry","Oddberry","Cloudberry","Bluefruit","Bloodfruit","Strawberry","Sunfruit","Strangefruit","Petrified Berry","Frostfruit","Blossom","Banana","Apple","Lemon","Orange","Mango","Watermelon","Pumpkin","Pumpkins","Carrot","Carrots","Corn","Barley","Coconut","Jelly","Egg","Eggs","Raw Meat","Raw Fish","Raw Morsel","Raw Crab","Raw Squid","Raw Eel","Raw Baracuda","Cooked Meat","Cooked Fish","Cooked Morsel","Cooked Crab","Cooked Squid","Cooked Eel","Cooked Baracuda","Cooked Egg","Bread","Pie","Fruit Cake","Cornbread","Fried Egg","Fried Cactus","Jelly Sandwich","Meat Sandwich","Cookies","Peppermints","Poison Potion","Splash Poison Potion","Swiftness Potion","Splash Swiftness Potion","Phantasm Potion","Splash Phantasm Potion","Haste Potion","Splash Haste Potion","Fire Resistance Potion","Splash Fire Resistance Potion","Strength Potion","Splash Strength Potion","Healing Potion","Splash Healing Potion","Harming Potion","Splash Harming Potion","Placebo Potion","Splash Placebo Potion" },
-}
-__ASTER_RUNTIME.FarmCfg = {
-	-- Auto Farm (plantar / cosechar)
-	AutoHarvest   = true,
-	AutoPlant     = true,
-	AutoMove      = false,   -- te mueve (teletransporte suave) hacia la siguiente caja/planta
-	MoveSpeed     = 17,      -- studs/s (máx. del original: 17)
-	FarmRange     = 125,     -- radio de búsqueda de cajas y plantas (original: 125)
-	CacheInterval = 3,       -- cada cuántos segundos vuelve a buscar cajas y plantas
-	ActionRange   = 25,      -- distancia a la que interactúa con caja/planta (original: 25)
-	ActionDelay   = 0.05,    -- segundos entre tandas de plantar/cosechar (antes 0.1)
-	ActionsPerTick = 3,      -- cuantas cajas/plantas procesa por tanda (antes 1)
-	PlantCooldown = 0.6,     -- no vuelve a plantar la misma caja hasta que pase este tiempo
-	PlantItems    = { "Bluefruit" },  -- semillas a plantar (se rotan si hay varias)
-
-	-- Pickup Aura (recoger ítems del suelo)
-	AutoPickup     = true,
-	PickupRange    = 25,     -- studs (original: 5)
-	PickupDelay    = 0,      -- segundos entre recogidas (original: 0)
-	PickupTargets  = { "Gold" },  -- "All" o nombres de ítems: { "Wood", "Stone" }
-	PickupChests   = true,   -- también recoger ítems dentro de cofres
-	ScanInterval   = 0.25,   -- cada cuántos segundos busca ítems cercanos
-}
-
--- ===== FARM: Auto Plant / Auto Harvest / Pickup Aura (se controla desde el menú Automation) =====
-task.spawn(function()
--- Auto Plant + Auto Harvest + Pickup Aura independientes (extraído/reescrito de tu script Boo Hub)
--- NO PROBADO en el juego: si falla, mira la consola (F9) y pásame el error.
--- Los valores se pueden cambiar en vivo desde el executor, por ejemplo:
---   getgenv().FarmCfg.AutoPlant = false
---   getgenv().FarmCfg.PickupRange = 15
--- Para detenerlo por completo:  getgenv().FarmStop()
--- Los controles están en el menú: pestaña Automation > "Farm".
-
-local CFG = __ASTER_RUNTIME.FarmCfg
-
-if not game:IsLoaded() then game.Loaded:Wait() end
-
-local cloneref = cloneref or function(x) return x end
-local Players = cloneref(game:GetService("Players"))
-local RS = cloneref(game:GetService("ReplicatedStorage"))
-local CollectionService = cloneref(game:GetService("CollectionService"))
-local Workspace = cloneref(game:GetService("Workspace"))
-
-if getgenv().FarmStop then getgenv().FarmStop() end
-getgenv().FarmCfg = CFG
-
-repeat task.wait() until RS:FindFirstChild("GameLoaded")
-
-local lp = Players.LocalPlayer
-local Packets = require(RS.Modules.Packets)
-local ItemIDS = require(RS.Modules.ItemIDS)
-local okFn, functions = pcall(function() return require(RS.Game.functions) end)
-if not okFn then functions = nil end
-
-local running = true
-
-local function char() return lp.Character end
-local function hrp()
-	local c = char()
-	return c and c:FindFirstChild("HumanoidRootPart")
-end
-
-local function firepacket(name, ...)
-	if not Packets[name] then return false end
-	local ok, err = pcall(Packets[name].send, ...)
-	if not ok then warn("[Farm] packet falló:", name, err) end
-	return ok
-end
-
-local function toList(v)
-	if type(v) == "string" then return { v } end
-	if type(v) == "table" then return v end
-	return {}
-end
-
-----------------------------------------------------------------------
--- Inventario (se lee de la interfaz, igual que el original)
-----------------------------------------------------------------------
-local inventory = {}
-local function updateInventory()
-	table.clear(inventory)
-	pcall(function()
-		local list = lp.PlayerGui.MainGui.RightPanel.Inventory.List
-		for _, o in ipairs(list:GetChildren()) do
-			if o:IsA("GuiObject") then inventory[o.Name] = o.LayoutOrder end
-		end
-	end)
-end
-
-local function availablePlantItems()
-	local out = {}
-	for _, name in ipairs(toList(CFG.PlantItems)) do
-		if ItemIDS[name] and inventory[name] then table.insert(out, name) end
-	end
-	return out
-end
-
-----------------------------------------------------------------------
--- Auto Farm: caché de cajas de plantar y plantas
-----------------------------------------------------------------------
-local plantboxes, plants = {}, {}
-local lastCache = 0
-local lastAction = 0
-local plantIndex = 0
-local lastMove = tick()
-
-local function refreshTable(list, isBox)
-	local root = hrp()
-	if not root then return end
-	for i = #list, 1, -1 do
-		local entry = list[i]
-		local model = entry.Model
-		if not model or not model.Parent then
-			table.remove(list, i)
-		else
-			local pos
-			if isBox then
-				local cb = model:FindFirstChild("collisionBox")
-				if not cb or model:FindFirstChild("Seed") then
-					table.remove(list, i)
-					continue
-				end
-				pos = cb.Position
-			else
-				pos = model:GetPivot().Position
-			end
-			entry.Position = pos
-			entry.Distance = (pos - root.Position).Magnitude
-			if entry.Distance > CFG.FarmRange then table.remove(list, i) end
-		end
-	end
-	table.sort(list, function(a, b) return a.Distance < b.Distance end)
-end
-
-local function cacheFarm()
-	lastCache = tick()
-	table.clear(plantboxes)
-	table.clear(plants)
-	local c, root = char(), hrp()
-	if not c or not root then return end
-
-	local canPlant = #availablePlantItems() > 0
-
-	local params = OverlapParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	local filter = { c, Workspace.Terrain, Workspace.Items, Workspace.Rubble, Workspace.Resources, Workspace.Players }
-	for _, t in ipairs(CollectionService:GetTagged("Contents")) do table.insert(filter, t) end
-	params.FilterDescendantsInstances = filter
-
-	local hip = 0
-	local hum = c:FindFirstChildOfClass("Humanoid")
-	if hum then hip = hum.HipHeight end
-	local center = CFrame.new(c:GetPivot().Position) - (Vector3.new(0, hip, 0) + Vector3.new(0, 2, 0))
-	local size = Vector3.new(CFG.FarmRange * 2, 15, CFG.FarmRange * 2)
-	local parts = Workspace:GetPartBoundsInBox(center, size, params)
-
-	local seenBox, seenPlant = {}, {}
-	for _, part in ipairs(parts) do
-		local model = part:FindFirstAncestorWhichIsA("Model")
-		if not model then continue end
-
-		-- cajas de plantar
-		if CFG.AutoPlant and canPlant and model.Parent == Workspace.Deployables then
-			if model.Name == "Plant Box" and model:FindFirstChild("collisionBox")
-				and not model:FindFirstChild("Seed") and not seenBox[model] then
-				local pos = model.collisionBox.Position
-				local dist = (pos - root.Position).Magnitude
-				if dist <= CFG.FarmRange then
-					seenBox[model] = true
-					table.insert(plantboxes, { Model = model, Position = pos, Distance = dist })
-				end
-			end
-		end
-
-		-- plantas para cosechar
-		if CFG.AutoHarvest and not seenPlant[model]
-			and model.Parent ~= Workspace.Resources and model.Parent ~= Workspace.Critters
-			and model.Parent ~= Workspace.Deployables and model.Parent ~= Workspace.Rubble
-			and model.Name ~= "Plant Box" then
-			local lname = string.lower(model.Name)
-			if lname:find("bush", 1, true) or lname:find("tree", 1, true)
-				or lname:find("crop", 1, true) or lname:find("cacti", 1, true) then
-				if model:GetAttribute("size") ~= "massive" then
-					local pos = model:GetPivot().Position
-					local dist = (pos - root.Position).Magnitude
-					if dist <= CFG.FarmRange then
-						seenPlant[model] = true
-						table.insert(plants, { Model = model, Position = pos, Distance = dist })
-					end
-				end
-			end
-		end
-	end
-
-	refreshTable(plantboxes, true)
-	refreshTable(plants, false)
-end
-
-local recentlyPlanted = {}
-
-local function doHarvest(root, maxActions)
-	maxActions = maxActions or 1
-	local done = 0
-	local remove = {}
-	for i = 1, #plants do
-		if done >= maxActions then break end
-		local p = plants[i]
-		local model = p and p.Model
-		if model and model.Parent then
-			if (model:GetPivot().Position - root.Position).Magnitude <= CFG.ActionRange then
-				firepacket("Pickup", model:GetAttribute("EntityID"))
-				remove[#remove + 1] = i
-				done = done + 1
-			end
-		else
-			remove[#remove + 1] = i
-		end
-	end
-	for k = #remove, 1, -1 do table.remove(plants, remove[k]) end
-	return #remove > 0
-end
-
-local function doPlant(root, maxActions)
-	maxActions = maxActions or 1
-	local items = availablePlantItems()
-	if #items == 0 then return false end
-	local now = tick()
-	local done = 0
-	local remove = {}
-	for i = 1, #plantboxes do
-		if done >= maxActions then break end
-		local b = plantboxes[i]
-		local model = b and b.Model
-		local cb = model and model.Parent and model:FindFirstChild("collisionBox")
-		if not cb or model:FindFirstChild("Seed") then
-			remove[#remove + 1] = i
-		elseif (cb.Position - root.Position).Magnitude <= CFG.ActionRange then
-			local last = recentlyPlanted[model]
-			if not last or now - last > (CFG.PlantCooldown or 0.6) then
-				plantIndex = plantIndex + 1
-				if plantIndex > #items then plantIndex = 1 end
-				firepacket("InteractStructure", {
-					entityID = model:GetAttribute("EntityID"),
-					itemID = ItemIDS[items[plantIndex]],
-				})
-				recentlyPlanted[model] = now
-				done = done + 1
-			end
-		end
-	end
-	for k = #remove, 1, -1 do table.remove(plantboxes, remove[k]) end
-	for m, tt in pairs(recentlyPlanted) do
-		if not m.Parent or now - tt > 5 then recentlyPlanted[m] = nil end
-	end
-	return done > 0 or #remove > 0
-end
-
-local function doMove(root)
-	local pos
-	if CFG.AutoPlant and plantboxes[1] and plantboxes[1].Model and plantboxes[1].Model.Parent then
-		local cb = plantboxes[1].Model:FindFirstChild("collisionBox")
-		if cb then pos = cb.Position end
-	end
-	if not pos and CFG.AutoHarvest and plants[1] and plants[1].Model and plants[1].Model.Parent then
-		pos = plants[1].Model:GetPivot().Position
-	end
-	if not pos then
-		lastMove = tick()
-		return
-	end
-	local goal = pos + Vector3.new(0, 3, 0)
-	local delta = goal - root.Position
-	local mag = delta.Magnitude
-	local now = tick()
-	if mag > 0.1 then
-		local step = math.min(CFG.MoveSpeed * math.clamp(now - lastMove, 0, 1 / 30), mag)
-		local rot = root.CFrame - root.CFrame.Position
-		root.CFrame = CFrame.new(root.Position + delta.Unit * step) * rot
-	else
-		root.CFrame = CFrame.new(goal) * (root.CFrame - root.CFrame.Position)
-	end
-	lastMove = now
-end
-
-----------------------------------------------------------------------
--- Pickup Aura
-----------------------------------------------------------------------
-local validItems = {}
-local lastScan = 0
-local lastPickup = 0
-local recentlyPicked = {}
-
-local function scanItems()
-	lastScan = tick()
-	table.clear(validItems)
-	local c, root = char(), hrp()
-	if not c or not root then return end
-
-	local params = OverlapParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.MaxParts = 1000
-	params.FilterDescendantsInstances = { c, Workspace.Players, Workspace.Terrain, Workspace.Resources, Workspace.Critters, Workspace.Rubble }
-
-	local parts = Workspace:GetPartBoundsInBox(c:GetPivot(), Vector3.new(50, 50, 50), params)
-	local seen = {}
-	for _, part in ipairs(parts) do
-		local model = part:FindFirstAncestorWhichIsA("Model")
-		local item
-		if part.Parent == Workspace.Items then
-			item = part
-		elseif model and model.Parent == Workspace.Items then
-			item = model
-		elseif CFG.PickupChests then
-			local contents = part:FindFirstAncestor("Contents")
-			if contents then
-				if part.Parent == contents then
-					item = part
-				elseif model and model.Parent == contents then
-					item = model
-				end
-			end
-		end
-		if item and item.Parent and not seen[item] then
-			seen[item] = true
-			table.insert(validItems, item)
-		end
-	end
-end
-
-local function doPickup(root)
-	local targets = {}
-	for _, n in ipairs(toList(CFG.PickupTargets)) do targets[n] = true end
-	local now = tick()
-	for _, item in ipairs(validItems) do
-		if item.Parent then
-			local dist = (root.Position - item:GetPivot().Position).Magnitude
-			if dist < CFG.PickupRange and (targets.All or targets[item.Name]) then
-				local last = recentlyPicked[item]
-				if (not last or now - last > 0.3) and CFG.PickupDelay < now - lastPickup then
-					local canBear = true
-					if functions and functions.canBearLoad then
-						local ok, res = pcall(functions.canBearLoad, item)
-						if ok then canBear = res end
-					end
-					if canBear then
-						firepacket("Pickup", item:GetAttribute("EntityID"))
-						recentlyPicked[item] = now
-						lastPickup = now
-					end
-				end
-			end
-		end
-	end
-	-- limpieza del registro de ítems ya recogidos
-	for item, t in pairs(recentlyPicked) do
-		if not item.Parent or now - t > 5 then recentlyPicked[item] = nil end
-	end
-end
-
-----------------------------------------------------------------------
--- Bucle principal
-----------------------------------------------------------------------
-task.spawn(function()
-	while running do
-		local root = hrp()
-		local hum = char() and char():FindFirstChildOfClass("Humanoid")
-		if root and hum and hum.Health > 0 then
-			local now = tick()
-			local farming = CFG.AutoPlant or CFG.AutoHarvest
-
-			if farming then
-				if now - lastCache >= CFG.CacheInterval then
-					updateInventory()
-					cacheFarm()
-				end
-				if CFG.AutoMove then doMove(root) end
-				if now - lastAction >= CFG.ActionDelay then
-					local did = false
-					local batch = math.max(1, math.floor(tonumber(CFG.ActionsPerTick) or 1))
-					if CFG.AutoHarvest then did = doHarvest(root, batch) end
-					if CFG.AutoPlant then did = doPlant(root, batch) or did end
-					if did then lastAction = now end
-				end
-			end
-
-			if CFG.AutoPickup then
-				if now - lastScan >= CFG.ScanInterval then scanItems() end
-				doPickup(root)
-			end
-		end
-		task.wait()
-	end
-end)
-
-getgenv().FarmStop = function()
-	running = false
-	getgenv().FarmStop = nil
-end
-
-print("[Farm] cargado: AutoPlant=" .. tostring(CFG.AutoPlant) .. " AutoHarvest=" .. tostring(CFG.AutoHarvest) .. " AutoPickup=" .. tostring(CFG.AutoPickup))
-end)
-
--- ============================================================
--- 7. AUTO EAT + WASTE FRUITS
--- ============================================================
-do
-autoHitSelection = "SwingHit"
-
-end
-do
-
-local RunService = game:GetService("RunService")
-
-function resolveHealFruitItemId(fruitName)
-    if not fruitName or fruitName == "" then return nil end
-    local cached = healFruitData[fruitName]
-    if cached == false then cached = nil end
-    if type(cached) == "number" and cached > 0 then return cached end
-    local id = autoDiscoverItemID(fruitName)
-    if id == nil and craftNameToID then
-        id = craftNameToID[fruitName]
-    end
-    if type(id) == "number" and id > 0 then
-        healFruitData[fruitName] = id
-        return id
-    end
-    return nil
-end
-
-end
-do
-
-end
-do
-
-end
-do
-function getInventorySlotAndCount(itemName)
-    local mainGui = plr.PlayerGui:FindFirstChild("MainGui")
-    if not mainGui then return nil, nil end
-    local inventory = mainGui.RightPanel and mainGui.RightPanel.Inventory and mainGui.RightPanel.Inventory.List
-    if not inventory then return nil, nil end
-    local item = inventory:FindFirstChild(itemName)
-    if item then
-        local slotID = item.LayoutOrder
-        local count = 0
-        local qtyImage = item:FindFirstChild("QuantityImage")
-        if qtyImage then
-            local qtyText = qtyImage:FindFirstChild("QuantityText")
-            if qtyText and qtyText.Text ~= "" then
-                local clean = qtyText.Text:gsub("%D", "")
-                count = tonumber(clean) or 0
-            end
-        end
-        if count == 0 then
-             local attrCount = item:GetAttribute("Count") or item:GetAttribute("Amount")
-             if attrCount then count = attrCount end
-        end
-        return slotID, count
-    end
-    return nil, nil
-end
-
-function eatDownToCap(fruitName, cap)
-    local fruitID = resolveHealFruitItemId(fruitName)
-    if not fruitID then return end
-    cap = tonumber(cap) or 0
-    local slotID, count = getInventorySlotAndCount(fruitName)
-
-    if slotID and count then
-        if count > cap then
-            local toEat = count - cap
-            if toEat > 20 then toEat = 20 end
-            for i = 1, toEat do
-                if not (Settings.WasteFruitsEnabled or Settings.EatCapEnabled) then break end
-                pcall(function()
-                    local actionId = getPacketId("UseBagItem")
-                    local b = buffer.create(8)
-                    buffer.writeu8(b, 0, 0)
-                    buffer.writeu8(b, 1, actionId)
-                    buffer.writeu32(b, 2, slotID)
-                    buffer.writeu16(b, 6, fruitID)
-                    if ByteNetReliable then ByteNetReliable:FireServer(b) end
-                end)
-                task.wait(0.25)
-            end
-        end
-    end
-end
-
-function startEatCap()
-    task.spawn(function()
-        while Settings.WasteFruitsEnabled or Settings.EatCapEnabled do
-            local wasteFruit = Settings.WasteFruit or "Bloodfruit"
-            local cap = tonumber(Settings.FruitsCapAmount) or tonumber(Settings.EatCap) or 100
-            if wasteFruit and cap then eatDownToCap(wasteFruit, cap) end
-            task.wait(1)
-        end
-    end)
-end
-
-end
-do
-autoEatActive = false
-
-function startAutoEat()
-    if autoEatActive then return end
-    autoEatActive = true
-    task.spawn(function()
-        while Settings.AutoEatEnabled do
-            if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
-
-                local mainGui = plr.PlayerGui:FindFirstChild("MainGui")
-                local hungerVal = 100
-                if mainGui then
-                    local bars = mainGui:FindFirstChild("Panels") and mainGui.Panels:FindFirstChild("Stats") and mainGui.Panels.Stats:FindFirstChild("Bars")
-                    if bars then
-                        local hungerLabel = bars:FindFirstChild("Hunger") and bars.Hunger:FindFirstChild("ValueLabel")
-                        if hungerLabel and hungerLabel:IsA("TextLabel") then
-                            local num = tonumber(hungerLabel.Text)
-                            if num then hungerVal = num end
-                        end
-                    end
-                end
-
-                if hungerVal <= (Settings.EatThreshold or 70) then
-
-                     local fruitName = Settings.EatFruit or "Bloodfruit"
-                     local fruitID = resolveHealFruitItemId(fruitName)
-
-                     if fruitID and mainGui then
-                         local rightPanel = mainGui:FindFirstChild("RightPanel")
-                         local inventory = rightPanel and rightPanel:FindFirstChild("Inventory")
-                         local list = inventory and inventory:FindFirstChild("List")
-
-                         local slotID = nil
-                         if list then
-                             for _, item in ipairs(list:GetChildren()) do
-                                 if item:IsA("ImageLabel") and item.Name == fruitName then
-                                     slotID = item.LayoutOrder
-                                     break
-                                 end
-                             end
-                         end
-
-                         if slotID then
-                             pcall(function()
-                                 local actionId = getPacketId("UseBagItem")
-                                 local b = buffer.create(8)
-                                 buffer.writeu8(b, 0, 0)
-                                 buffer.writeu8(b, 1, actionId)
-                                 buffer.writeu32(b, 2, slotID)
-                                 buffer.writeu16(b, 6, fruitID)
-                                 if ByteNetReliable then ByteNetReliable:FireServer(b) end
-                             end)
-                             local delayTime = 1 / (Settings.HealCPS or 1)
-                             task.wait(delayTime)
-                         else
-
-                             task.wait(1)
-                         end
-                     else
-                         task.wait(1)
-                     end
-                else
-                     task.wait(0.5)
-                end
-            else
-                task.wait(1)
-            end
-        end
-        autoEatActive = false
-    end)
-end
-
-end
-
--- ============================================================
--- 8. GOLD & PATHS (backend completo: paths, tween, noclip, movimiento, circuito)
--- ============================================================
 function getGoldPathList()
     local list = {"None"}
     local folder = "ASTERTween"
     if not isfolder(folder) then makefolder(folder) end
     for _, file in ipairs(listfiles(folder)) do
         if file:find(".json") then
-
+            -- Use exact filename matching to prevent partial matches
             table.insert(list, file:match("([^/\\]+)%.json$"))
         end
     end
@@ -2000,11 +421,14 @@ function updateVisualNodes()
     if not Settings.GoldVisual then if f then f:Destroy() end return end
     if not f then f = Instance.new("Folder", workspace) f.Name = "GoldNodes" end
     f:ClearAllChildren()
-
+    -- Render Optimization: Only show waypoints near the player
+    local RENDER_DISTANCE = 300 
+    
     local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+    local playerPos = hrp and hrp.Position or Vector3.new(0,0,0)
 
     for i, pos in ipairs(Settings.recordedPositions) do
-
+        -- Show ALL waypoints (Distance check removed as requested)
         if true then
             local p = Instance.new("Part", f)
             p.Size = Vector3.new(0.3, 0.3, 0.3)
@@ -2014,25 +438,26 @@ function updateVisualNodes()
             p.Color = Color3.fromRGB(255, 215, 0)
             p.Transparency = 0.5
             p.Material = Enum.Material.Neon
-
+            
+            -- Add floating number (Restored Circular Style)
             local bg = Instance.new("BillboardGui", p)
             bg.Size = UDim2.new(0, 20, 0, 20)
             bg.StudsOffset = Vector3.new(0, 1.5, 0)
             bg.AlwaysOnTop = true
-
+            
             local frame = Instance.new("Frame", bg)
             frame.Size = UDim2.new(1, 0, 1, 0)
             frame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
             frame.BackgroundTransparency = 0.3
-
+            
             local corner = Instance.new("UICorner", frame)
-            corner.CornerRadius = UDim.new(1, 0)
-
+            corner.CornerRadius = UDim.new(1, 0) -- Circular
+            
             local border = Instance.new("UIStroke", frame)
-            border.Color = Color3.fromRGB(255, 215, 0)
+            border.Color = Color3.fromRGB(255, 215, 0) -- Gold border
             border.Thickness = 1.5
             border.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-
+            
             local tl = Instance.new("TextLabel", frame)
             tl.Size = UDim2.new(1, 0, 1, 0)
             tl.BackgroundTransparency = 1
@@ -2044,21 +469,68 @@ function updateVisualNodes()
     end
 end
 
+function initializeCircuit()
+    local pathFolder = "ASTERTween"
+    local fileName = "GoldCircuit.json"
+    local filePath = pathFolder .. "/" .. fileName
+    -- 1. ONLY run this if the folder doesn't exist yet
+    if not isfolder(pathFolder) then
+
+        makefolder(pathFolder)
+
+        -- 2. Your coordinate string (Paste inside the [[ ]])
+        local rawData = [[
+            
+        ]] 
+
+        if rawData ~= " " and rawData ~= "" then
+            local success, decoded = pcall(function() 
+                return httpservice:JSONDecode(rawData) 
+            end)
+            
+            if success and decoded then
+                writefile(filePath, rawData) -- Save it so we skip the string next time
+                Settings.recordedPositions = decoded.positions
+
+            else
+
+            end
+        end
+    else
+        -- 3. If folder exists, we skip the long string and just load the file
+        if isfile(filePath) then
+
+            local success, data = pcall(function() 
+                return httpservice:JSONDecode(readfile(filePath)) 
+            end)
+            if success and data then
+                Settings.recordedPositions = data.positions
+            end
+        end
+    end
+end
+
+-- MOVEMENT & GOLD LOGIC
 currentWaypoint = 1
 isTweening = false
 walkingToWaypoint = false
-isWaitingForWaypoint = false
-waypointWaitStartTime = 0
+isWaitingForWaypoint = false -- New: Track if waiting at a waypoint
+waypointWaitStartTime = 0 -- New: Track when wait started
 alignPosition = nil
 alignAttachment0 = nil
 alignAttachment1 = nil
 restoreCollision = nil
-plantAlignPosition = nil
-plantAttachment0 = nil
-plantAttachment1 = nil
-plantIsTweening = false
 
-WALK_SPEED = 21
+rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+function updateRayParams()
+    if plr.Character then rayParams.FilterDescendantsInstances = {plr.Character} end
+end
+plr.CharacterAdded:Connect(updateRayParams)
+if plr.Character then updateRayParams() end
+
+GOLD_SPEED_MAX = 30 -- velocidad maxima permitida en el slider (antes 16)
+WALK_SPEED = 16
 NEAR_GOLD_SPEED = 16
 SPEED_VARIANCE = 0.05
 SPEED_CHANGE_INTERVAL = 0.5
@@ -2090,7 +562,7 @@ function hasLineOfSight(startPos, endPos)
 end
 
 function wouldTweenHitTerrain(startPos, endPos)
-    local sampleCount = 3
+    local sampleCount = 3 
     local direction = (endPos - startPos)
     for i = 0, sampleCount do
         local t = i / sampleCount
@@ -2131,7 +603,7 @@ function hasGroundBeneath(position)
 end
 
 function isAboveWater(position)
-    if position.Y > 100 then return false end
+    if position.Y > 100 then return false end 
     local ray = workspace:Raycast(position, Vector3.new(0, -200, 0), rayParams)
     if ray and ray.Instance and ray.Instance:IsA("Terrain") then
         local region = Region3.new(ray.Position - Vector3.new(4, 4, 4), ray.Position + Vector3.new(4, 4, 4))
@@ -2215,7 +687,7 @@ function createAlignPosition(hrp)
     alignPosition = Instance.new("AlignPosition")
     alignPosition.Attachment0 = alignAttachment0
     alignPosition.Attachment1 = alignAttachment1
-    alignPosition.MaxForce = 400000
+    alignPosition.MaxForce = 400000 
     alignPosition.MaxVelocity = 100
     alignPosition.Responsiveness = 200
     alignPosition.ApplyAtCenterOfMass = true
@@ -2238,7 +710,7 @@ end
 
 function tweenToWaypoint(hrp, hum, target, speed)
     removeBodyVelocity(hrp)
-    hum:ChangeState(Enum.HumanoidStateType.Freefall)
+    hum:ChangeState(Enum.HumanoidStateType.Freefall) 
     if not alignPosition then createAlignPosition(hrp) end
     alignAttachment1.WorldPosition = target
     alignPosition.MaxVelocity = speed
@@ -2267,10 +739,6 @@ end
 
 antiFlipGyro = nil
 function enableAntiFlip(hrp)
-    if antiFlipGyro and antiFlipGyro.Parent ~= hrp then
-        pcall(function() antiFlipGyro:Destroy() end)
-        antiFlipGyro = nil
-    end
     if not antiFlipGyro then
         antiFlipGyro = Instance.new("BodyGyro")
         antiFlipGyro.Name = "AntiFlipGyro"
@@ -2280,6 +748,7 @@ function enableAntiFlip(hrp)
         antiFlipGyro.Parent = hrp
     end
 end
+function disableAntiFlip() if antiFlipGyro then antiFlipGyro:Destroy() antiFlipGyro = nil end end
 
 restoreCollision = function()
     if plr.Character then
@@ -2310,16 +779,22 @@ positionHistory = {}
 maxHistorySize = 5
 
 noclipTimer = 0
-do
 local noclipWorldParts = {}
-local noclipDepOverlap = OverlapParams.new()
-noclipDepOverlap.FilterType = Enum.RaycastFilterType.Include
 
 function disableWorldCollision(part)
     if not part or not part:IsA("BasePart") then return end
     if noclipWorldParts[part] ~= nil then return end
     noclipWorldParts[part] = part.CanCollide
     part.CanCollide = false
+end
+
+function restoreWorldNoclip()
+    for part, wanted in pairs(noclipWorldParts) do
+        if part and part.Parent then
+            part.CanCollide = wanted
+        end
+    end
+    noclipWorldParts = {}
 end
 
 function noclip()
@@ -2343,7 +818,7 @@ function noclip()
                 end
             end
         end
-        if Settings.GoldNoclip and hrp and not (Settings.TweenToBushAndBox or Settings.TweenToPlantBox or Settings.TweenToBush) then
+        if Settings.GoldNoclip and hrp then
             pcall(function()
                 local hrpPos = hrp.Position
                 local radiusSq = 55 * 55
@@ -2363,89 +838,31 @@ function noclip()
                 end
                 local deployables = getWorkspaceDeployables()
                 if deployables then
-                    noclipDepOverlap.FilterDescendantsInstances = {deployables}
-                    local nearby = workspace:GetPartBoundsInRadius(hrpPos, 40, noclipDepOverlap)
-                    local cap = math.min(#nearby, 64)
-                    for i = 1, cap do
-                        disableWorldCollision(nearby[i])
+                    for _, item in ipairs(deployables:GetChildren()) do
+                        local pos
+                        if item:IsA("BasePart") then
+                            pos = item.Position
+                        elseif item:IsA("Model") then
+                            local ok, pivotPos = pcall(function() return item:GetPivot().Position end)
+                            if ok then pos = pivotPos end
+                        end
+                        if pos then
+                            local d = pos - hrpPos
+                            if d.X * d.X + d.Y * d.Y + d.Z * d.Z <= 40 * 40 then
+                                if item:IsA("BasePart") then
+                                    disableWorldCollision(item)
+                                else
+                                    for _, p in ipairs(item:GetDescendants()) do
+                                        if p:IsA("BasePart") then disableWorldCollision(p) end
+                                    end
+                                end
+                            end
+                        end
                     end
                 end
             end)
         end
     end
-end
-
-local _goldLogAt = {}
--- ¿este modelo es un gold node? (nombre con "gold node", EntityID 422, o recurso con "gold" en el nombre)
-local function _isGoldModel(m)
-    if not m or not m:IsA("Model") then return false end
-    local lname = m.Name:lower()
-    if lname:find("gold node", 1, true) or m:GetAttribute("EntityID") == 422 then return true end
-    if lname:find("gold", 1, true) and (m.Parent == workspace:FindFirstChild("Resources") or m.Parent == workspace:FindFirstChild("Mounds")) then
-        return true
-    end
-    return false
-end
-
--- Misma detección que ASTER unificado: escanea una caja alrededor, sube por los modelos de cada parte
--- y mide la distancia hasta el centro del modelo. Las paredes y el techo no influyen.
-function goldNodeNearby(pos)
-    local radius = tonumber(Settings.GoldDetectRange) or 13
-
-    local ignore = { workspace.Terrain }
-    local playersFolder = workspace:FindFirstChild("Players")
-    if playersFolder then table.insert(ignore, playersFolder) end
-    local itemsFolder = workspace:FindFirstChild("Items")
-    if itemsFolder then table.insert(ignore, itemsFolder) end
-    if plr.Character then table.insert(ignore, plr.Character) end
-    for _, o in ipairs(game:GetService("CollectionService"):GetTagged("Contents")) do table.insert(ignore, o) end
-    local params = OverlapParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = ignore
-
-    local side = radius * 2 + 4
-    local parts = workspace:GetPartBoundsInBox(CFrame.new(pos), Vector3.new(side, side, side), params)
-    local best, bestDist, seen = nil, radius, {}
-    for _, part in ipairs(parts) do
-        local m = part
-        while m and m ~= workspace do
-            if m:IsA("Model") and not seen[m] then
-                seen[m] = true
-                if _isGoldModel(m) then
-                    local okP, piv = pcall(function() return m:GetPivot().Position end)
-                    if okP then
-                        local d = (piv - pos).Magnitude
-                        if d <= bestDist then best, bestDist = m, d end
-                    end
-                end
-            end
-            m = m.Parent
-        end
-    end
-
-    if best then
-        local now = tick()
-        if not _goldLogAt[best] or now - _goldLogAt[best] > 3 then
-            _goldLogAt[best] = now
-            print(string.format("[GoldDelay] gold node detectado: %s a %.1f studs", best.Name, bestDist))
-        end
-        return true, best
-    end
-
-    -- respaldo: búsqueda por esfera, por nombre de la pieza o de su padre
-    local okB, near = pcall(function() return workspace:GetPartBoundsInRadius(pos, radius) end)
-    if okB and near then
-        for _, p in ipairs(near) do
-            local parentIsGold = p.Parent and (p.Parent.Name:lower():find("gold node") or p.Parent:GetAttribute("EntityID") == 422)
-            local nameMatch = p.Name:lower():find("gold node") or parentIsGold
-            if nameMatch then
-                local node = parentIsGold and p.Parent or p
-                print("[GoldDelay] gold node detectado (respaldo): " .. tostring(node.Name))
-                return true, node
-            end
-        end
-    end
-    return false
 end
 
 function startMovementEngine()
@@ -2454,8 +871,95 @@ function startMovementEngine()
     local lastFramePos = nil
     local isWaitingForDelay = false
     local delayStartTime = 0
+    local goldWaitNode = nil -- gold node que se está picando mientras esperamos
+    -- ¿este modelo es un gold node? (nombre con "gold node", EntityID 422, o recurso con "gold" en el nombre)
+    local function isGoldNodeModel(m)
+        if not m or not m:IsA("Model") then return false end
+        local lname = m.Name:lower()
+        if lname:find("gold node", 1, true) or m:GetAttribute("EntityID") == 422 then return true end
+        if lname:find("gold", 1, true) and (m.Parent == workspace:FindFirstChild("Resources") or m.Parent == workspace:FindFirstChild("Mounds")) then
+            return true
+        end
+        return false
+    end
+    -- mismo método que el Mine Aura: escanea una caja alrededor, sube por los modelos de cada parte
+    -- y mide la distancia hasta el centro del modelo. Las paredes y el techo no influyen.
+    local function findNearbyGoldNode(pos, radius)
+        local ignore = { workspace.Terrain }
+        local playersFolder = workspace:FindFirstChild("Players")
+        if playersFolder then table.insert(ignore, playersFolder) end
+        local itemsFolder = workspace:FindFirstChild("Items")
+        if itemsFolder then table.insert(ignore, itemsFolder) end
+        if plr.Character then table.insert(ignore, plr.Character) end
+        for _, o in ipairs(game:GetService("CollectionService"):GetTagged("Contents")) do table.insert(ignore, o) end
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignore
+        local side = radius * 2 + 4
+        local parts = workspace:GetPartBoundsInBox(CFrame.new(pos), Vector3.new(side, side, side), params)
+        local best, bestDist, seen = nil, radius, {}
+        for _, part in ipairs(parts) do
+            local m = part
+            while m and m ~= workspace do
+                if m:IsA("Model") and not seen[m] then
+                    seen[m] = true
+                    if isGoldNodeModel(m) then
+                        -- distancia al punto mas cercano de la caja del modelo (sirve para nodos grandes o arriba)
+                        local d
+                        local okB, bcf, bsize = pcall(function() return m:GetBoundingBox() end)
+                        if okB and bcf and bsize then
+                            local lp = bcf:PointToObjectSpace(pos)
+                            local h = bsize / 2
+                            d = Vector3.new(math.max(math.abs(lp.X) - h.X, 0), math.max(math.abs(lp.Y) - h.Y, 0), math.max(math.abs(lp.Z) - h.Z, 0)).Magnitude
+                        else
+                            local okP, piv = pcall(function() return m:GetPivot().Position end)
+                            if okP then d = (piv - pos).Magnitude end
+                        end
+                        if d and d <= bestDist then best, bestDist = m, d end
+                    end
+                end
+                m = m.Parent
+            end
+        end
+        return best, bestDist
+    end
+    -- diagnostico: si no detecta nada, imprime (F9) que hay con "gold" cerca y a que distancia
+    local lastDiagTick = 0
+    local goldLogAt = {}
+    local function diagnoseGold(pos, radius)
+        if tick() - lastDiagTick < 3 then return end
+        lastDiagTick = tick()
+        local ignore = { workspace.Terrain }
+        if plr.Character then table.insert(ignore, plr.Character) end
+        local playersFolder = workspace:FindFirstChild("Players")
+        if playersFolder then table.insert(ignore, playersFolder) end
+        local params = OverlapParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignore
+        local okS, parts = pcall(function()
+            return workspace:GetPartBoundsInBox(CFrame.new(pos), Vector3.new(120, 120, 120), params)
+        end)
+        if not okS then return end
+        local best, bestD, bestPart = nil, math.huge, nil
+        for _, part in ipairs(parts) do
+            local m = part
+            while m and m ~= workspace do
+                if m.Name:lower():find("gold", 1, true) then
+                    local d = (part.Position - pos).Magnitude
+                    if d < bestD then best, bestD, bestPart = m, d, part end
+                    break
+                end
+                m = m.Parent
+            end
+        end
+        if best then
+            print(string.format("[GoldDelay] NO detectado (radio %d). Mas cercano con 'gold': %s [%s] padre=%s a %.1f studs, altura dy=%.1f",
+                radius, best.Name, best.ClassName, best.Parent and best.Parent.Name or "?", bestD, bestPart.Position.Y - pos.Y))
+        else
+            print(string.format("[GoldDelay] NO detectado (radio %d). No hay nada con 'gold' en el nombre a 60 studs", radius))
+        end
+    end
     local lastDecisionTick = 0
-    local goldWaitNode = nil
     local cachedShouldTween = false
     local cachedTweenReason = ""
     local cachedWalkSpeed = 20
@@ -2464,6 +968,8 @@ function startMovementEngine()
             if movementConnection then movementConnection:Disconnect() movementConnection = nil end
             local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
             if hrp then removeBodyVelocity(hrp) end
+            local hum0 = plr.Character and plr.Character:FindFirstChild("Humanoid")
+            if hum0 then hum0.WalkSpeed = Settings.WalkSpeed or 16 end
             if hrp and not isTweening then table.insert(positionHistory, hrp.Position) if #positionHistory > maxHistorySize then table.remove(positionHistory, 1) end end
             restoreCollision()
             isTweening = false walkingToWaypoint = false walkAttemptTimer = 0 stuckCheckWaypoint = nil stuckCheckStartDistance = nil stuckCheckTimer = 0 isWaitingForWaypoint = false
@@ -2471,16 +977,16 @@ function startMovementEngine()
             lastFramePos = nil
             return
         end
-
+        
         if #Settings.recordedPositions == 0 then return end
         local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
         local hum = plr.Character and plr.Character:FindFirstChild("Humanoid")
         if not hrp or not hum then return end
-
+        
         local currentPos = hrp.Position
         if lastFramePos then
             local distMoved = (currentPos - lastFramePos).Magnitude
-            if distMoved > 10 then
+            if distMoved > 10 then 
                 local closestIndex, closestDist = findNearestAccessibleWaypoint(currentPos)
                 if closestIndex then
                     currentWaypoint = closestIndex
@@ -2495,8 +1001,8 @@ function startMovementEngine()
         lastFramePos = currentPos
 
         enableAntiFlip(hrp)
-        if (hum.PlatformStand or hum.Sit or hum:GetState() == Enum.HumanoidStateType.FallingDown or hum:GetState() == Enum.HumanoidStateType.Ragdoll) and not isTweening then
-            hum.PlatformStand = false hum.Sit = false hum:ChangeState(Enum.HumanoidStateType.Running)
+        if (hum.PlatformStand or hum.Sit or hum:GetState() == Enum.HumanoidStateType.FallingDown or hum:GetState() == Enum.HumanoidStateType.Ragdoll) and not isTweening then 
+            hum.PlatformStand = false hum.Sit = false hum:ChangeState(Enum.HumanoidStateType.Running) 
         end
         if currentWaypoint > #Settings.recordedPositions then currentWaypoint = 1 walkingToWaypoint = false walkAttemptTimer = 0 removeBodyVelocity(hrp) removeAlignPosition() isTweening = false if hum then hum:ChangeState(Enum.HumanoidStateType.Running) hum.PlatformStand = false end stuckCheckWaypoint = nil stuckCheckStartDistance = nil stuckCheckTimer = 0 isWaitingForWaypoint = false return end
         local targetPos = Settings.recordedPositions[currentWaypoint]
@@ -2520,7 +1026,7 @@ function startMovementEngine()
             end
         end
         if distance <= 3 then
-
+            -- Waypoint Wait Logic
             local currentWPData = Settings.recordedPositions[currentWaypoint]
             if currentWPData and currentWPData.waitTime and currentWPData.waitTime > 0 then
                 if not isWaitingForWaypoint then
@@ -2542,12 +1048,39 @@ function startMovementEngine()
                 isWaitingForWaypoint = false
             end
 
+
             if not isWaitingForDelay then
-                local foundGold, nodeModel = goldNodeNearby(hrp.Position)
-                goldWaitNode = foundGold and nodeModel or nil
+                local foundGold = false
+                goldWaitNode = nil
+                local searchRadius = tonumber(Settings.GoldDetectRange) or 13
+                local nodeModel, nodeDist = findNearbyGoldNode(hrp.Position, searchRadius)
+                if nodeModel then
+                    foundGold = true
+                    goldWaitNode = nodeModel
+                    local now = tick()
+                    if not goldLogAt[nodeModel] or now - goldLogAt[nodeModel] > 3 then
+                        goldLogAt[nodeModel] = now
+                        print(string.format("[GoldDelay] gold node detectado: %s a %.1f studs", nodeModel.Name, nodeDist))
+                    end
+                else
+                    local checkParts = workspace:GetPartBoundsInRadius(hrp.Position, searchRadius)
+                    for _, p in pairs(checkParts) do
+                        local parentIsGold = p.Parent and (p.Parent.Name:lower():find("gold node") or p.Parent:GetAttribute("EntityID") == 422)
+                        local nameMatch = p.Name:lower():find("gold node") or parentIsGold
+                        if nameMatch then
+                            foundGold = true
+                            goldWaitNode = parentIsGold and p.Parent or p
+                            break
+                        end
+                    end
+                end
+
+                if not foundGold then diagnoseGold(hrp.Position, searchRadius) end
+
                 print(string.format("[GoldDelay] waypoint %d | radio=%s | esperar hasta picar=%s | delay=%s | max=%s | gold=%s",
-                    currentWaypoint, tostring(Settings.GoldDetectRange), tostring(Settings.GoldWaitUntilMined),
-                    tostring(Settings.GoldDelay), tostring(Settings.GoldMaxWait), foundGold and tostring(nodeModel.Name) or "no encontrado"))
+                    currentWaypoint, tostring(searchRadius), tostring(Settings.GoldWaitUntilMined),
+                    tostring(Settings.GoldDelay), tostring(Settings.GoldMaxWait),
+                    foundGold and tostring(goldWaitNode and goldWaitNode.Name) or "no encontrado"))
 
                 if foundGold and (Settings.GoldDelay > 0 or Settings.GoldWaitUntilMined) then
                     isWaitingForDelay = true
@@ -2559,7 +1092,7 @@ function startMovementEngine()
                 end
             else
                 local waited = tick() - delayStartTime
-                -- espera mientras el gold node siga existiendo (se esta picando), con limite de seguridad
+                -- espera mientras el gold node siga existiendo (se está picando), con límite de seguridad
                 local stillMining = Settings.GoldWaitUntilMined
                     and goldWaitNode ~= nil
                     and goldWaitNode.Parent ~= nil
@@ -2577,6 +1110,7 @@ function startMovementEngine()
 
             local nextIndex = currentWaypoint + 1
             if nextIndex > #Settings.recordedPositions then nextIndex = 1 end
+            local currentAboveWater = Settings.WaterTweenEnabled and (isAboveWater(currentPos) or isAboveWater(target))
             local nextAboveWater = false
             local nextPosData = Settings.recordedPositions[nextIndex]
             if nextPosData then local nextVec = Vector3.new(nextPosData.X, nextPosData.Y, nextPosData.Z) nextAboveWater = Settings.WaterTweenEnabled and isAboveWater(nextVec) end
@@ -2608,7 +1142,8 @@ function startMovementEngine()
 
             cachedShouldTween = false
             cachedTweenReason = ""
-
+            
+            -- FORCED TWEEN ONLY LOGIC FROM ASTERFarm.lua
             if Settings.TweenOnly then
                 cachedShouldTween = true
                 cachedTweenReason = "Forced"
@@ -2616,7 +1151,7 @@ function startMovementEngine()
                 local heightDiff = target.Y - currentPos.Y
                 local horizontalDist = math.sqrt((target.X - currentPos.X)^2 + (target.Z - currentPos.Z)^2)
                 local wouldHitTerrain, hitPoint = wouldTweenHitTerrain(currentPos, target)
-
+                
                 if wouldHitTerrain then cachedShouldTween = false elseif heightDiff < -2 then cachedShouldTween = false else
                     local pathClear, hitPos = isPathClearToTarget(currentPos, target)
                     if not pathClear then cachedShouldTween = true cachedTweenReason = "Path blocked" end
@@ -2631,17 +1166,17 @@ function startMovementEngine()
             end
         end
 
-        if walkingToWaypoint then
-            walkAttemptTimer = walkAttemptTimer + deltaTime
-            if walkAttemptTimer > maxWalkAttemptTime then
+        if walkingToWaypoint then 
+            walkAttemptTimer = walkAttemptTimer + deltaTime 
+            if walkAttemptTimer > maxWalkAttemptTime then 
                 local horizontalDist = math.sqrt((target.X - currentPos.X)^2 + (target.Z - currentPos.Z)^2)
-                local startDist = (Vector3.new(targetPos.X, currentPos.Y, targetPos.Z) - currentPos).Magnitude
-                if startDist > horizontalDist - 5 then cachedShouldTween = true cachedTweenReason = "Stuck walking" walkAttemptTimer = 0 end
-            end
+                local startDist = (Vector3.new(targetPos.X, currentPos.Y, targetPos.Z) - currentPos).Magnitude 
+                if startDist > horizontalDist - 5 then cachedShouldTween = true cachedTweenReason = "Stuck walking" walkAttemptTimer = 0 end 
+            end 
         end
-
-        hum.WalkSpeed = Settings.WalkSpeed or 16
-
+        
+        hum.WalkSpeed = Settings.WalkSpeed or cachedWalkSpeed
+        
         if cachedShouldTween then
             if cachedTweenReason == "Water" then waterTweenActive = true end
             walkingToWaypoint = false walkAttemptTimer = 0 stuckCheckStartDistance = distance stuckCheckTimer = 0
@@ -2653,6 +1188,7 @@ function startMovementEngine()
     end)
 end
 
+local goldNoclipActive = false
 do
     local old = __ASTER_RUNTIME.connections["goldNoclip"]
     if old and old.Disconnect then
@@ -2660,32 +1196,120 @@ do
         __ASTER_RUNTIME.connections["goldNoclip"] = nil
     end
 end
+function startGoldNoclip()
+    if goldNoclipActive then return end
+    goldNoclipActive = true
+    task.spawn(function()
+        local RunService = game:GetService("RunService")
+        local connection
+        connection = RunService.Heartbeat:Connect(function()
+            if not Settings.GoldNoclip then
+                connection:Disconnect()
+                return
+            end
+            noclip()
+        end)
+        trackConnection("goldNoclip", connection)
+        while Settings.GoldNoclip do
+            task.wait(0.5)
+        end
+        if connection then connection:Disconnect() end
+        __ASTER_RUNTIME.connections["goldNoclip"] = nil
+        goldNoclipActive = false
+        restoreWorldNoclip()
+        restoreCollision()
+    end)
+end
 
+-- [ Shared Equip Logic ] --
+function getToolSlot(toolName)
+    local GameUtil = nil
+    pcall(function() GameUtil = require(game:GetService("ReplicatedStorage").Modules.GameUtil) end)
+    if not GameUtil then return nil end
+    local toolbar = GameUtil.Data.toolbar
+    if not toolbar then return nil end
+    for i = 1, 6 do
+        if toolbar[i] and toolbar[i].name == toolName then
+            return i
+        end
+    end
+    return nil
+end
+
+function equipItemPacket(name)
+     if ByteNetReliable then
+         local slot = getToolSlot(name)
+         if slot then
+             local equipPacketId = getPacketId("EquipTool")
+             if not equipPacketId then return end
+             local b = buffer.create(4)
+             buffer.writeu8(b, 0, 0)
+             buffer.writeu8(b, 1, equipPacketId)
+             buffer.writeu16(b, 2, slot)
+             ByteNetReliable:FireServer(b)
+         else
+             if plr.Character then
+                 local tool = plr.Backpack:FindFirstChild(name)
+                 if tool then plr.Character.Humanoid:EquipTool(tool) end
+             end
+         end
+     else
+         if plr.Character then
+             local tool = plr.Backpack:FindFirstChild(name)
+             if tool then plr.Character.Humanoid:EquipTool(tool) end
+         end
+     end
+end
+
+function isToolEquipped(toolName)
+    local playersFolder = workspace:FindFirstChild("Players")
+    if playersFolder then
+        local plrFolder = playersFolder:FindFirstChild(plr.Name)
+        if plrFolder then
+            local toolsFolder = plrFolder:FindFirstChild("Tools")
+            if toolsFolder and toolsFolder:FindFirstChild(toolName) then
+                return true
+            end
+        end
+    end
+    if plr.Character and plr.Character:FindFirstChild(toolName) then
+        return true
+    end
+    return false
+end
+
+function isAnyToolEquipped()
+    local playersFolder = workspace:FindFirstChild("Players")
+    if playersFolder then
+        local plrFolder = playersFolder:FindFirstChild(plr.Name)
+        if plrFolder then
+            local toolsFolder = plrFolder:FindFirstChild("Tools")
+            if toolsFolder and #toolsFolder:GetChildren() > 0 then
+                return true
+            end
+        end
+    end
+    if plr.Character and plr.Character:FindFirstChildOfClass("Tool") then
+        return true
+    end
+    return false
+end
+
+local goldActive = false
 function stopGoldCircuit()
     Settings.GoldCircuitEnabled = false
-    pcall(function()
-        if movementConnection then movementConnection:Disconnect() end
-    end)
-    movementConnection = nil
-    pcall(function()
-        local character = plr.Character
-        local hrp = character and character:FindFirstChild("HumanoidRootPart")
-        local hum = character and character:FindFirstChildOfClass("Humanoid")
-        if hrp then
-            removeBodyVelocity(hrp)
-            hrp.Velocity = Vector3.new(0, 0, 0)
-            hrp.RotVelocity = Vector3.new(0, 0, 0)
-        end
-        if hum and hrp then hum:MoveTo(hrp.Position) end
-    end)
-    pcall(removeAlignPosition)
-    pcall(function()
-        if antiFlipGyro then antiFlipGyro:Destroy() end
-    end)
-    antiFlipGyro = nil
-    pcall(function()
-        if restoreCollision then restoreCollision() end
-    end)
+    if movementConnection then
+        movementConnection:Disconnect()
+        movementConnection = nil
+    end
+    local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+    if hrp then
+        removeBodyVelocity(hrp)
+        removeAlignPosition()
+    end
+    if restoreCollision then restoreCollision() end
+    local hum0 = plr.Character and plr.Character:FindFirstChild("Humanoid")
+    if hum0 then hum0.WalkSpeed = Settings.WalkSpeed or 16 end
     isTweening = false
     walkingToWaypoint = false
     goldActive = false
@@ -2700,9 +1324,13 @@ function stopGoldCircuit()
 end
 
 function startGoldCircuit()
-    if goldActive and movementConnection then return end
+    if goldActive then return end
     goldActive = true
-
+    Settings.GoldSpeed = math.clamp(tonumber(Settings.GoldSpeed) or 16, 1, GOLD_SPEED_MAX)
+    Settings.GoldDelay = math.max(tonumber(Settings.GoldDelay) or 0, 0)
+    WALK_SPEED = Settings.GoldSpeed
+    
+    -- Cleanup Old Boards
     local res = getWorkspaceResources()
     if res then
         for _, v in ipairs(res:GetChildren()) do
@@ -2728,1340 +1356,22 @@ function startGoldCircuit()
         currentWaypoint = closestIndex
     end
     startMovementEngine()
-
+    
+    -- Start Auto Equip Manager separately to keep main loop pure
     if Settings.GoldAutoEquip then
         startGoldEquipManager()
     end
-
+    
     task.spawn(function()
         while Settings.GoldCircuitEnabled do task.wait(0.5) end
         goldActive = false
     end)
 end
-end
 
--- ============================================================
--- 9. AUTO DROP
--- ============================================================
-function getQuantity(itemFrame)
-    local qImage = itemFrame:FindFirstChild("QuantityImage")
-    local qText = qImage and qImage:FindFirstChild("QuantityText")
-    if qText and qText.Text ~= "" then
-        local cleanString = qText.Text:gsub("%D", "")
-        return tonumber(cleanString) or 0
-    end
-    return 0
-end
 
 do
-local function getDropInventoryCount(targetName)
-    local mainGui = game:GetService("Players").LocalPlayer.PlayerGui:FindFirstChild("MainGui")
-    local invList = mainGui and mainGui.RightPanel and mainGui.RightPanel.Inventory and mainGui.RightPanel.Inventory.List
-    if not invList then return 0 end
-
-    local lowerTarget = tostring(targetName or ""):lower():match("^%s*(.-)%s*$")
-    if not lowerTarget or lowerTarget == "" then return 0 end
-
-    for _, child in ipairs(invList:GetChildren()) do
-        if child:IsA("GuiObject") then
-            local childNameLower = child.Name:lower():match("^%s*(.-)%s*$")
-            if childNameLower == lowerTarget then
-                local attrCount = child:GetAttribute("Count") or child:GetAttribute("Amount") or child:GetAttribute("Quantity")
-                if attrCount then return tonumber(attrCount) or 0 end
-
-                local quantity = getQuantity(child)
-                if quantity > 0 then return quantity end
-                return 1
-            end
-        end
-    end
-
-    return 0
-end
-
-function dynamicDrop(targetName)
-    local invList = game:GetService("Players").LocalPlayer.PlayerGui.MainGui.RightPanel.Inventory.List
-
-    local function findItemFrame(nameToFind)
-        local lowerTarget = nameToFind:lower():match("^%s*(.-)%s*$")
-        if not lowerTarget or lowerTarget == "" then return nil end
-
-        for _, child in ipairs(invList:GetChildren()) do
-            if child:IsA("GuiObject") then
-                local childNameLower = child.Name:lower():match("^%s*(.-)%s*$")
-                if childNameLower == lowerTarget then
-                    return child
-                end
-            end
-        end
-        return nil
-    end
-
-    local itemFrame = findItemFrame(targetName)
-    if itemFrame then
-        local quantity = getQuantity(itemFrame)
-        if quantity <= 0 then quantity = 1 end
-
-        local slotIndex = itemFrame.LayoutOrder
-        if slotIndex then
-            if ByteNetReliable then
-                 local dropId = getPacketId("DropBagItem")
-                 if dropId then
-                     local b = buffer.create(4)
-                     buffer.writeu8(b, 0, 0)
-                     buffer.writeu8(b, 1, dropId)
-                     buffer.writeu16(b, 2, slotIndex)
-                     ByteNetReliable:FireServer(b)
-                 end
-            end
-
-            if quantity <= 10 then
-                return 0.2
-            else
-                return 0
-            end
-        end
-    end
-    return 0.5
-end
-
-local autoDropCounts = {}
-local autoDropStartCounts = {}
-local autoDropLastKey = nil
-
-if not __ASTER_RUNTIME.autoDropLoopStarted then
-    __ASTER_RUNTIME.autoDropLoopStarted = true
-    local session = CURRENT_SESSION
-    task.spawn(function()
-        while isRuntimeSessionActive(session) do
-            local waitTime = 0.5
-            if Settings.AutoDropEnabled and Settings.DropItem and Settings.DropItem ~= "" then
-             local parsedDropAmount = tonumber(Settings.DropAmount)
-             local hasDropLimit = parsedDropAmount ~= nil and parsedDropAmount > 0
-             local dropAmount = hasDropLimit and math.floor(parsedDropAmount) or math.huge
-             local dropKey = tostring(Settings.DropItem or "") .. "|" .. (hasDropLimit and tostring(dropAmount) or "Infinite")
-             if autoDropLastKey ~= dropKey then
-                 table.clear(autoDropCounts)
-                 table.clear(autoDropStartCounts)
-                 autoDropLastKey = dropKey
-             end
-             local droppedAny = false
-             for item in string.gmatch(Settings.DropItem, '([^,]+)') do
-                 local cleanItem = item:match("^%s*(.-)%s*$")
-                 if cleanItem ~= "" then
-                     local itemKey = cleanItem:lower()
-                     if hasDropLimit and autoDropStartCounts[itemKey] == nil then
-                         autoDropStartCounts[itemKey] = getDropInventoryCount(cleanItem)
-                     end
-
-                     local droppedCount = 0
-                     if hasDropLimit then
-                         local currentCount = getDropInventoryCount(cleanItem)
-                         droppedCount = math.max(0, (autoDropStartCounts[itemKey] or currentCount) - currentCount)
-                         autoDropCounts[itemKey] = droppedCount
-                     end
-
-                     if droppedCount < dropAmount then
-                         local delay = dynamicDrop(cleanItem)
-                         if delay == 0 then
-                             droppedAny = true
-
-                             if hasDropLimit then task.wait(0.15) else task.wait() end
-                         elseif delay == 0.2 then
-
-                             task.wait(0.2)
-                         end
-
-                         if hasDropLimit and delay ~= 0.5 then
-                             local currentCount = getDropInventoryCount(cleanItem)
-                             autoDropCounts[itemKey] = math.max(0, (autoDropStartCounts[itemKey] or currentCount) - currentCount)
-                         end
-                     end
-                 end
-             end
-             if droppedAny then waitTime = 0 else waitTime = 0.1 end
-        else
-             if autoDropLastKey ~= nil then
-                 table.clear(autoDropCounts)
-                 table.clear(autoDropStartCounts)
-                 autoDropLastKey = nil
-             end
-        end
-        task.wait(waitTime)
-    end
-    end)
-end
-end
-
--- ============================================================
--- 10. AUTO BED RESPAWN
--- ============================================================
-do
-respawnActive = false
-function startAutoRespawn()
-    if respawnActive then return end
-    respawnActive = true
-    local spawnMenuPos = Vector3.new(-1686.31201, -3, -2534.19409)
-    local detectionRange = 5
-    local lastAttempt = 0
-    local attemptCooldown = 5
-    task.spawn(function()
-        while Settings.AutoRespawnEnabled do
-            pcall(function()
-                local char = plr.Character
-                local root = char and char:FindFirstChild("HumanoidRootPart")
-                if root then
-                    local distance = (root.Position - spawnMenuPos).Magnitude
-                    if distance <= detectionRange and (tick() - lastAttempt) > attemptCooldown then
-                        lastAttempt = tick()
-                        task.wait(2)
-                        pcall(function()
-                            if ByteNetReliable then
-                                local b = buffer.create(4)
-                                buffer.writeu8(b, 0, 0)
-                                buffer.writeu8(b, 1, getPacketId("RequestBedSpawn"))
-                                buffer.writeu16(b, 2, 128)
-                                ByteNetReliable:FireServer(b)
-
-                                task.wait(0.2)
-
-                                local b2 = buffer.create(2)
-                                buffer.writeu8(b2, 0, 0)
-                                buffer.writeu8(b2, 1, getPacketId("RequestBedSpawn"))
-                                ByteNetReliable:FireServer(b2)
-                            end
-                        end)
-                        pcall(function()
-                            local pGui = plr.PlayerGui
-                            for _, gui in pairs(pGui:GetDescendants()) do
-                                if (gui:IsA("TextButton") or gui:IsA("ImageButton")) and gui.Visible then
-                                    local text = gui:IsA("TextButton") and gui.Text:lower() or ""
-                                    local name = gui.Name:lower()
-                                    if name:find("bed") or text:find("bed") or name:find("spawn") or text:find("spawn") then
-                                        if firesignal then firesignal(gui.MouseButton1Click) firesignal(gui.Activated) end
-                                        break
-                                    end
-                                end
-                            end
-                        end)
-                    end
-                end
-            end)
-            task.wait(1)
-        end
-        respawnActive = false
-    end)
-end
-end
-
--- ============================================================
--- 11. AUTO FUEL CAMPFIRE
--- ============================================================
-do
-
-local _fuelGuiActive = false
-local function _fuelGuiVisible(o)
-    local pg = plr:FindFirstChild("PlayerGui")
-    local p = o
-    while p and p ~= pg do
-        if p:IsA("GuiObject") and not p.Visible then return false end
-        if p:IsA("ScreenGui") and not p.Enabled then return false end
-        p = p.Parent
-    end
-    return p == pg
-end
-local function _fuelClick(btn)
-    local fired = false
-    for _, sig in ipairs({"Activated", "MouseButton1Click", "MouseButton1Down", "MouseButton1Up"}) do
-        if getconnections then
-            local ok, conns = pcall(getconnections, btn[sig])
-            if ok and type(conns) == "table" and #conns > 0 then
-                for _, c in ipairs(conns) do pcall(function() c:Fire() end) end
-                fired = true
-                break
-            end
-        end
-    end
-    if not fired and firesignal then
-        pcall(function() firesignal(btn.Activated) end)
-        pcall(function() firesignal(btn.MouseButton1Click) end)
-    end
-end
-local function _campfireFuel(fire)
-    if not fire then return nil end
-    for _, d in ipairs(fire:GetDescendants()) do
-        if d:IsA("TextLabel") then
-            local n = tonumber(d.Text)
-            if n then return n end
-        end
-    end
-    return nil
-end
-local function _aviso(t)
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification", {Title = "AutoFuel", Text = tostring(t):sub(1, 200), Duration = 12})
-    end)
-end
-local _fuelInfoShown = false
-
-local function _openCampfireMenu(fire)
-    local cd
-    for _, d in ipairs(fire:GetDescendants()) do
-        if d:IsA("ClickDetector") then cd = d break end
-    end
-    if cd and fireclickdetector then
-        pcall(fireclickdetector, cd)
-        return
-    end
-    local eid = fire:GetAttribute("EntityID")
-    local pid = getPacketId("InteractStructure")
-    if not _fuelInfoShown then
-        _fuelInfoShown = true
-        _aviso("Abriendo fogata: EntityID=" .. tostring(eid) .. " paquete=" .. tostring(pid))
-    end
-    if eid and pid and ByteNetReliable then
-        local b = buffer.create(6)
-        buffer.writeu8(b, 0, 0)
-        buffer.writeu8(b, 1, pid)
-        buffer.writeu32(b, 2, eid)
-        ByteNetReliable:FireServer(b)
-    end
-end
-
-local function _fireList(range)
-    local out = {}
-    local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-    local dep = getWorkspaceDeployables()
-    if not hrp or not dep then return out end
-    for _, v in ipairs(dep:GetChildren()) do
-        if v.Name == "Campfire" then
-            local p = v.PrimaryPart or v:FindFirstChildWhichIsA("BasePart")
-            if p then
-                local d = (p.Position - hrp.Position).Magnitude
-                if d <= range then out[#out + 1] = {fire = v, dist = d} end
-            end
-        end
-    end
-    table.sort(out, function(a, b) return a.dist < b.dist end)
-    return out
-end
-
-local function _waitFuelUp(fire, before, maxWait)
-    local t0 = os.clock()
-    repeat
-        task.wait(0.05)
-        local now = _campfireFuel(fire)
-        if now and now > before then return true end
-    until os.clock() - t0 >= maxWait
-    return false
-end
-
-function startAutoFuel()
-    if _fuelGuiActive then return end
-    _fuelGuiActive = true
-    task.spawn(function()
-        local handlers = {}
-        local noted = false
-        local cooldown, bad = {}, {}
-        local menuFire, menuStart, lastOpen = nil, 0, 0
-        local warnedItems = -1e9
-
-        local function getGui()
-            local gui = plr.PlayerGui:FindFirstChild("Campfire")
-            local frame = gui and gui:FindFirstChild("Frame")
-            return gui, frame and frame:FindFirstChild("List")
-        end
-
-        local function memorize(list)
-            if not list or not getconnections or not debug or not debug.getupvalues then return end
-            for _, b in ipairs(list:GetChildren()) do
-                if b:IsA("GuiButton") and b.Name ~= "Exit" and not handlers[b.Name] then
-                    pcall(function()
-                        local conns = getconnections(b.Activated)
-                        local f = conns[1] and conns[1].Function
-                        if not f then return end
-                        local st
-                        for _, v in pairs(debug.getupvalues(f)) do
-                            if type(v) == "table" and rawget(v, "selectionTarget") ~= nil then st = v break end
-                        end
-                        if st then
-                            handlers[b.Name] = {f = f, st = st, kind = typeof(st.selectionTarget) == "Instance" and st.selectionTarget.ClassName or "?"}
-                            if not noted then
-                                noted = true
-                                _aviso("Auto Fuel listo: ahora alimenta sin abrir el menu")
-                            end
-                        end
-                    end)
-                end
-            end
-        end
-
-        local function availableNames()
-            local want = Settings.FuelType or "All (Wood/Log/Leaves)"
-            local names = (want:sub(1, 3) == "All") and {"Wood", "Log", "Leaves"} or {want}
-            local avail = {}
-            for _, n in ipairs(names) do
-                if getlayout(n) then avail[#avail + 1] = n end
-            end
-            return avail
-        end
-
-        local function closeMenu()
-            local gui, list = getGui()
-            if menuFire and list then
-                local exit = list.Parent:FindFirstChild("Exit") or list:FindFirstChild("Exit")
-                if exit then _fuelClick(exit) end
-            end
-            menuFire = nil
-            if gui and Settings.AutoFuelHideMenu then pcall(function() gui.Enabled = false end) end
-        end
-
-        local function feed(fire, feeds)
-            local avail = availableNames()
-            if #avail == 0 then return "noitems" end
-
-            if Settings.AutoFuelDirect then
-                local usable = {}
-                for _, n in ipairs(avail) do
-                    if handlers[n] then usable[#usable + 1] = handlers[n] end
-                end
-                if #usable > 0 then
-                    for i = 1, feeds do
-                        local h = usable[((i - 1) % #usable) + 1]
-                        local target = fire
-                        if h.kind ~= "Model" and h.kind ~= "Folder" then
-                            target = fire.PrimaryPart or fire:FindFirstChildWhichIsA("BasePart") or fire
-                        end
-                        h.st.selectionTarget = target
-                        task.spawn(function() pcall(h.f) end)
-                    end
-                    return true
-                end
-            end
-
-            if not Settings.AutoFuelOpenMenu then return false end
-            local gui, list = getGui()
-            local ready = menuFire == fire and (os.clock() - menuStart) < 20
-            if not ready then
-                if os.clock() - lastOpen < 0.35 then return false end
-                lastOpen = os.clock()
-                _openCampfireMenu(fire)
-                local t0 = os.clock()
-                repeat
-                    task.wait(0.05)
-                    gui, list = getGui()
-                until (list and _fuelGuiVisible(list)) or os.clock() - t0 > 1.2
-                if not (list and _fuelGuiVisible(list)) then return false end
-                menuFire, menuStart = fire, os.clock()
-                memorize(list)
-                if gui and Settings.AutoFuelHideMenu then pcall(function() gui.Enabled = false end) end
-            end
-            if not list then return false end
-            for i = 1, feeds do
-                local n = avail[((i - 1) % #avail) + 1]
-                local b = list:FindFirstChild(n)
-                if b and b:IsA("GuiButton") then _fuelClick(b) end
-            end
-            return true
-        end
-
-        while Settings.AutoFuelEnabled and not ScriptKilled do
-            local busy = false
-            pcall(function()
-                local range = tonumber(Settings.FuelRange) or 30
-                local threshold = Settings.FuelThreshold or 200
-                local feeds = math.clamp(math.floor(tonumber(Settings.FuelFeeds) or 2), 1, 6)
-                local fires = _fireList(range)
-                if Settings.FuelAllNearby == false and #fires > 1 then fires = {fires[1]} end
-
-                local gui, list = getGui()
-                if list and _fuelGuiVisible(list) then
-                    memorize(list)
-                    if Settings.AutoFuelOpenMenu and Settings.AutoFuelHideMenu and next(handlers) and gui then
-                        pcall(function() gui.Enabled = false end)
-                    end
-                end
-
-                for _, e in ipairs(fires) do
-                    if not Settings.AutoFuelEnabled then break end
-                    local fire = e.fire
-                    if fire and fire.Parent and (cooldown[fire] or 0) < os.clock() then
-                        local fuel = _campfireFuel(fire)
-                        if fuel and fuel < threshold then
-                            busy = true
-
-                            local guard = 0
-                            while Settings.AutoFuelEnabled and guard < 60 and fire.Parent do
-                                guard = guard + 1
-                                local before = _campfireFuel(fire)
-                                if not before or before >= threshold then break end
-                                local sent = feed(fire, feeds)
-                                if sent == "noitems" then
-                                    cooldown[fire] = os.clock() + 5
-                                    if os.clock() - warnedItems > 30 then
-                                        warnedItems = os.clock()
-                                        _aviso("Auto Fuel: no tenes " .. tostring(Settings.FuelType or "Wood/Log/Leaves") .. " en el inventario")
-                                    end
-                                    break
-                                elseif not sent then
-                                    cooldown[fire] = os.clock() + 3
-                                    break
-                                end
-                                if _waitFuelUp(fire, before, 0.5) then
-                                    bad[fire] = 0
-                                else
-                                    bad[fire] = (bad[fire] or 0) + 1
-                                    if bad[fire] >= 3 then
-                                        bad[fire] = 0
-                                        cooldown[fire] = os.clock() + 15
-                                        break
-                                    end
-                                end
-                            end
-                            if menuFire == fire then closeMenu() end
-                        end
-                    end
-                end
-            end)
-            task.wait(busy and 0.02 or 0.2)
-        end
-        pcall(function() if menuFire then closeMenu() end end)
-        _fuelGuiActive = false
-    end)
-end
-
-end
-
--- ============================================================
--- 11b. SIN VENTANA (modo headless)
--- No se crea ninguna interfaz: las funciones corren con los mismos valores
--- por defecto que muestra la version con ventana. Solo queda el HUD de
--- Tiempo / FPS / Oro (seccion HUD), con su boton Ruta y Elegir cofre.
--- Los ajustes se cambian editando los numeros en el script.
--- ============================================================
-ASTER = ASTER or {}
-ASTER.Options = ASTER.Options or {}
-
-do
-    -- cierra una ventana vieja si quedo de una ejecucion anterior
-    pcall(function()
-        local parentUI = getAsterHiddenUI()
-        for _, n in ipairs({ "ASTER_Window", "ASTER_Toggle" }) do
-            local old = parentUI:FindFirstChild(n)
-            if old then old:Destroy() end
-        end
-    end)
-
-    Window = { Tabs = {}, ElementRegistry = {}, Headless = true }
-
-    local function normSel(v)
-        local sel = {}
-        if type(v) == "table" then
-            for k, x in pairs(v) do
-                if type(k) == "number" then sel[x] = true elseif x then sel[k] = true end
-            end
-        end
-        return sel
-    end
-
-    function Window:AddTab(opts)
-        local tab = { Title = (opts and opts.Title) or "Tab" }
-        table.insert(Window.Tabs, tab)
-
-        function tab:AddLabel(text) return { Text = text } end
-
-        -- sin ventana nadie puede tocar un boton (la ruta "5" ya se carga sola)
-        function tab:AddButton(name, cb)
-            return { Name = name }
-        end
-
-        function tab:AddToggle(name, default, cb)
-            local state = (default == true)
-            local api = {
-                GetValue = function() return state end,
-                SetValue = function(v) state = (v == true) end,
-            }
-            Window.ElementRegistry[name] = api
-            return api
-        end
-
-        function tab:AddSlider(name, min, max, default, step, cb)
-            local value = default
-            local api = {
-                GetValue = function() return value end,
-                SetValue = function(v) value = v end,
-            }
-            Window.ElementRegistry[name] = api
-            return api
-        end
-
-        function tab:AddInput(name, default, cb)
-            local text = tostring(default or "")
-            local api = {
-                GetValue = function() return text end,
-                SetValue = function(v) text = tostring(v or "") end,
-            }
-            Window.ElementRegistry[name] = api
-            return api
-        end
-
-        local function buildDropdown(name, values, multi, initial)
-            local value, sel = nil, {}
-            if multi then sel = normSel(initial) else value = initial end
-            local api = {}
-            function api:SetValues(v) values = v or {} end
-            function api:SetValue(v)
-                if multi then sel = normSel(v) else value = v end
-            end
-            function api:GetValue()
-                if multi then
-                    local t = {}
-                    for k, x in pairs(sel) do if x then t[k] = true end end
-                    return t
-                end
-                return value
-            end
-            Window.ElementRegistry[name] = api
-            return api
-        end
-        function tab:AddDropdown(name, values, default, cb)
-            return buildDropdown(name, values, false, default)
-        end
-        function tab:AddMultiDropdown(name, values, default, cb)
-            return buildDropdown(name, values, true, default)
-        end
-
-        return tab
-    end
-
-    ASTER.Tabs = {}
-    ASTER.Tabs.Main = Window:AddTab({ Title = "Gold & Paths" })
-    ASTER.Tabs.Automation = Window:AddTab({ Title = "Automation" })
-    ASTER.Tabs.Combat = Window:AddTab({ Title = "Combat / PvP" })
-    ASTER.Tabs.Pickup = Window:AddTab({ Title = "Loot & Chests" })
-end
-
-
--- ============================================================
--- 11c. ITEM TOOLS (Item Deletion / Auto Craft / Items Into Chest)
--- Se maneja desde el menu: pestaña "Loot & Chests" y boton de cofre del HUD
--- ============================================================
-ItemTools = {
-    selecting = false,
-    selectedChest = nil,
-    status = "Cofre: ninguno seleccionado",
-    statusLabel = nil,
-    cfg = {
-        deleteEnabled = true,
-        deleteRange = 25,
-        deleteTargets = "Log, Stone, Raw Iron, Coal, Wood, Leaves,",
-        craftEnabled = true,
-        craftUseAmount = false,
-        craftObject = "Leaf Shirt",
-        craftAmount = 1,
-        craftDelay = 0.05,
-        chestEnabled = true,
-        chestTargets = "Raw Gold",
-    },
-}
-
-do
-    local IT = ItemTools
-    local RS = game:GetService("ReplicatedStorage")
-    local RunService = game:GetService("RunService")
-    local UIS = game:GetService("UserInputService")
-
-    local mods = {}
-    local function getMods()
-        if mods.ready then return mods end
-        local modules = RS:FindFirstChild("Modules")
-        if not modules then return mods end
-        local okP, Packets = pcall(function() return require(modules:FindFirstChild("Packets")) end)
-        local okG, GameUtil = pcall(function() return require(modules:FindFirstChild("GameUtil")) end)
-        local okI, ItemIDS = pcall(function() return require(modules:FindFirstChild("ItemIDS")) end)
-        if okP and okG and okI then
-            mods.Packets, mods.GameUtil, mods.ItemIDS = Packets, GameUtil, ItemIDS
-            mods.ready = true
-        end
-        return mods
-    end
-
-    local function sendPacket(name, ...)
-        local m = getMods()
-        local packet = m.Packets and m.Packets[name]
-        if not packet or type(packet.send) ~= "function" then
-            warn("[ItemTools] Packet no disponible:", name)
-            return false
-        end
-        local ok, err = pcall(packet.send, ...)
-        if not ok then warn("[ItemTools] Error enviando", name, err) end
-        return ok
-    end
-
-    local function inventoryIndex(itemName)
-        local gui = plr:FindFirstChildOfClass("PlayerGui")
-        local main = gui and gui:FindFirstChild("MainGui")
-        local right = main and main:FindFirstChild("RightPanel")
-        local inv = right and right:FindFirstChild("Inventory")
-        local list = inv and inv:FindFirstChild("List")
-        local entry = list and list:FindFirstChild(itemName)
-        return entry and entry.LayoutOrder
-    end
-
-    local function inventoryCount(itemName)
-        local index = inventoryIndex(itemName)
-        if not index then return 0 end
-        local m = getMods()
-        local data = m.GameUtil and m.GameUtil.Data and m.GameUtil.Data.inventory
-        local entry = data and data[index]
-        return entry and tonumber(entry.quantity) or 0
-    end
-
-    local function parseTargets(text)
-        local result = {}
-        for name in string.gmatch(text or "", "[^,]+") do
-            name = name:match("^%s*(.-)%s*$")
-            if name ~= "" then result[name] = true end
-        end
-        return result
-    end
-
-    local function getRoot()
-        local c = plr.Character
-        return c and c:FindFirstChild("HumanoidRootPart"), c
-    end
-
-    local function getWorldItems(root, char)
-        local itemsFolder = workspace:FindFirstChild("Items")
-        if not itemsFolder or not root then return {} end
-        local ignore = {}
-        if char then ignore[#ignore + 1] = char end
-        for _, n in ipairs({ "Players", "Terrain", "Resources", "Critters", "Rubble" }) do
-            local f = workspace:FindFirstChild(n)
-            if f then ignore[#ignore + 1] = f end
-        end
-        local params = OverlapParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.MaxParts = 1000
-        params.FilterDescendantsInstances = ignore
-        local parts = workspace:GetPartBoundsInBox(root.CFrame, Vector3.new(50, 50, 50), params)
-        local found, seen = {}, {}
-        for _, part in ipairs(parts) do
-            local item = part
-            if item.Parent ~= itemsFolder then
-                local model = part:FindFirstAncestorWhichIsA("Model")
-                if model and model.Parent == itemsFolder then item = model else item = nil end
-            end
-            if item and item.Parent and not seen[item] then
-                seen[item] = true
-                found[#found + 1] = item
-            end
-        end
-        return found
-    end
-
-    local function itemPosition(item)
-        if item:IsA("Model") then return item:GetPivot().Position end
-        if item:IsA("BasePart") then return item.Position end
-        return nil
-    end
-
-    -- ---------- estado / seleccion de cofre ----------
-    function IT.setStatus(text)
-        IT.status = text
-        if IT.statusLabel then IT.statusLabel.Text = text end
-    end
-
-    function IT.setSelecting(v)
-        IT.selecting = (v == true)
-        pcall(function()
-            local reg = Window and Window.ElementRegistry and Window.ElementRegistry["Select Chest (tap a chest)"]
-            if reg and reg.SetValue then reg.SetValue(IT.selecting) end
-        end)
-        if IT.selecting then IT.setStatus("Toca un cofre en el mundo...") end
-    end
-
-    local function findChestModel(inst)
-        local node = inst
-        while node and node ~= workspace do
-            if node:IsA("Model") and node.Name:lower():find("chest", 1, true) then return node end
-            node = node.Parent
-        end
-        return nil
-    end
-
-    local function pickChestAt(input)
-        local cam = workspace.CurrentCamera
-        if cam then
-            local _, char = getRoot()
-            local params = RaycastParams.new()
-            params.FilterType = Enum.RaycastFilterType.Exclude
-            params.FilterDescendantsInstances = char and { char } or {}
-            local ray = cam:ScreenPointToRay(input.Position.X, input.Position.Y)
-            local res = workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
-            local model = res and res.Instance and findChestModel(res.Instance)
-            if model then return model end
-        end
-        local okM, target = pcall(function() return plr:GetMouse().Target end)
-        if okM and target then return findChestModel(target) end
-        return nil
-    end
-
-    local selConn = UIS.InputBegan:Connect(function(input, processed)
-        if processed or not IT.selecting then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-            and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local model = pickChestAt(input)
-        if not model then return end
-        IT.selectedChest = model
-        IT.setSelecting(false)
-        IT.setStatus("Cofre: " .. model.Name .. " seleccionado")
-    end)
-
-    -- ---------- Auto Item Deletion ----------
-    local lastDelete = 0
-    local function runDeletion()
-        if not IT.cfg.deleteEnabled or os.clock() - lastDelete < 0.35 then return end
-        lastDelete = os.clock()
-        local root, char = getRoot()
-        if not root then return end
-        local range = math.clamp(tonumber(IT.cfg.deleteRange) or 5, 1, 25)
-        local targets = parseTargets(IT.cfg.deleteTargets)
-        if next(targets) == nil then return end
-        for _, item in ipairs(getWorldItems(root, char)) do
-            local pos = itemPosition(item)
-            if pos and (root.Position - pos).Magnitude <= range then
-                if targets.All or targets[item.Name] then
-                    pcall(function() item:Destroy() end)
-                end
-            end
-        end
-    end
-
-    -- ---------- Auto Craft ----------
-    local craftBusy = false
-    local function stopCraft()
-        IT.cfg.craftEnabled = false
-        pcall(function()
-            local reg = Window and Window.ElementRegistry and Window.ElementRegistry["Enable Auto Craft"]
-            if reg and reg.SetValue then reg.SetValue(false) end
-        end)
-    end
-    local function runCraft()
-        if craftBusy or not IT.cfg.craftEnabled then return end
-        local m = getMods()
-        if not m.ready then return end
-        craftBusy = true
-        task.spawn(function()
-            local itemName = IT.cfg.craftObject
-            local itemId = m.ItemIDS[itemName]
-            if not itemId then
-                warn("[ItemTools] Objeto invalido:", itemName)
-                craftBusy = false
-                stopCraft()
-                return
-            end
-            local delayTime = math.clamp(tonumber(IT.cfg.craftDelay) or 0.05, 0.01, 10)
-            local useAmount = IT.cfg.craftUseAmount
-            local amount = math.max(1, math.floor(tonumber(IT.cfg.craftAmount) or 1))
-            local initial = inventoryCount(itemName)
-            local targetCount = useAmount and (initial + amount) or math.huge
-            while IT.cfg.craftEnabled and inventoryCount(itemName) < targetCount do
-                local ok, canCraft = pcall(function()
-                    return m.GameUtil.canCraftItem(itemName, nil, true)
-                end)
-                if ok and canCraft then sendPacket("CraftItem", itemId) end
-                task.wait(delayTime)
-            end
-            craftBusy = false
-            -- con "Use Amount" se craftea la cantidad pedida una sola vez y se apaga
-            if useAmount and IT.cfg.craftEnabled then stopCraft() end
-        end)
-    end
-
-    -- ---------- Items Into Chest ----------
-    local chestBusy = false
-    local function runChest()
-        if chestBusy or not IT.cfg.chestEnabled then return end
-        local chest = IT.selectedChest
-        if not chest or not chest.Parent then
-            IT.setStatus("Selecciona un cofre primero")
-            return
-        end
-        local hitbox = chest:FindFirstChild("Hitbox")
-        if not hitbox then
-            IT.setStatus("El cofre no tiene Hitbox")
-            return
-        end
-        local targets = parseTargets(IT.cfg.chestTargets)
-        if next(targets) == nil then
-            IT.setStatus("Elegi Targets o escribi All")
-            return
-        end
-        chestBusy = true
-        task.spawn(function()
-            local root, char = getRoot()
-            if root then
-                for _, item in ipairs(getWorldItems(root, char)) do
-                    if not IT.cfg.chestEnabled then break end
-                    if item and item.Parent and (targets.All or targets[item.Name]) then
-                        local pos = itemPosition(item)
-                        local entityId = item:GetAttribute("EntityID")
-                        if pos and entityId and (root.Position - pos).Magnitude <= 25 then
-                            sendPacket("ForceInteract", entityId)
-                            task.wait(0.12)
-                            if item.Parent and chest and chest.Parent then
-                                pcall(function()
-                                    if item:IsA("Model") then
-                                        if item.PrimaryPart and not item.PrimaryPart.Anchored then
-                                            item:PivotTo(hitbox.CFrame)
-                                        end
-                                    elseif item:IsA("BasePart") and not item.Anchored then
-                                        item:PivotTo(hitbox.CFrame)
-                                    end
-                                end)
-                            end
-                        end
-                    end
-                end
-            end
-            chestBusy = false
-        end)
-    end
-
-    -- ---------- bucle ligero ----------
-    local acc = 0
-    local loopConn = RunService.Heartbeat:Connect(function(dt)
-        acc = acc + dt
-        if acc < 0.2 then return end
-        acc = 0
-        pcall(runDeletion)
-        pcall(runChest)
-        if IT.cfg.craftEnabled and not craftBusy then pcall(runCraft) end
-    end)
-
-    local keep = __ASTER_RUNTIME.windowConns
-    if type(keep) == "table" then
-        keep[#keep + 1] = selConn
-        keep[#keep + 1] = loopConn
-    end
-end
-
-
--- ============================================================
--- 12. UI / MENU
--- ============================================================
-do
-ASTER.Options.HealList = {}
-for n, _ in pairs(healFruitData) do
-    table.insert(ASTER.Options.HealList, n)
-end
-table.sort(ASTER.Options.HealList)
-
-ASTER.Options.AllFruitList = {}
-for _, name in ipairs(ALL_HEAL_FRUIT_NAMES or {}) do
-    table.insert(ASTER.Options.AllFruitList, name)
-end
-table.sort(ASTER.Options.AllFruitList)
-
-Settings.AutoEatEnabled = true
-Settings.EatFruit = "Bluefruit"
-Settings.EatThreshold = 1
-Settings.WasteFruitsEnabled = true
-Settings.EatCapEnabled = true
-Settings.WasteFruit = "Bluefruit"
-Settings.FruitsCapAmount = 100
-Settings.EatCap = 100
-local _wasteLoopOn = false
-local function _startWasteOnce()
-    if _wasteLoopOn then return end
-    _wasteLoopOn = true
-    startEatCap()
-end
-
-ASTER.Tabs.Combat:AddLabel("Auto Eat")
-ASTER.Tabs.Combat:AddToggle("Auto Eat", true, function(v)
-    Settings.AutoEatEnabled = v
-    if v then startAutoEat() end
-end)
-ASTER.Tabs.Combat:AddDropdown("Eat Fruit", ASTER.Options.HealList, "Bluefruit", function(v)
-    Settings.EatFruit = v
-end)
-ASTER.Tabs.Combat:AddSlider("Eat Threshold %", 1, 99, 1, 1, function(v)
-    Settings.EatThreshold = v
-end)
-
-ASTER.Tabs.Combat:AddLabel("Waste Fruits")
-ASTER.Tabs.Combat:AddToggle("Waste Fruits", true, function(v)
-    Settings.WasteFruitsEnabled = v
-    Settings.EatCapEnabled = v
-    if v then _startWasteOnce() else _wasteLoopOn = false end
-end)
-ASTER.Tabs.Combat:AddDropdown("Waste Fruit", ASTER.Options.AllFruitList, "Bluefruit", function(v)
-    Settings.WasteFruit = v
-end)
-ASTER.Tabs.Combat:AddInput("FruitsCap Amount", "100", function(v)
-    local n = tonumber(v) or 100
-    Settings.FruitsCapAmount = n
-    Settings.EatCap = n
-end)
-
-ASTER.Tabs.Automation:AddLabel("Tools")
-do
-    local mineDefault = __ASTER_RUNTIME.MineAuraEnabled
-    if mineDefault == nil then mineDefault = true end
-    ASTER.Tabs.Automation:AddToggle("Mine Aura", mineDefault, function(v)
-        __ASTER_RUNTIME.MineAuraEnabled = v == true
-        if __ASTER_RUNTIME.MineAuraSet then __ASTER_RUNTIME.MineAuraSet(v == true) end
-    end)
-end
-
-do
-    Settings.OldBoardsPass = true
-    local oldBoardParts = {}
-    local running = false
-
-    local function restoreBoards()
-        for part, was in pairs(oldBoardParts) do
-            if part and part.Parent then
-                pcall(function() part.CanCollide = was end)
-            end
-        end
-        oldBoardParts = {}
-    end
-
-    local function startBoards()
-        if running then return end
-        running = true
-        task.spawn(function()
-            while Settings.OldBoardsPass do
-                pcall(function()
-                    local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-                    local resources = getWorkspaceResources()
-                    if hrp and resources then
-                        local hrpPos = hrp.Position
-                        for _, model in ipairs(resources:GetChildren()) do
-                            if model.Name == "Old Boards" then
-                                for _, part in ipairs(model:GetDescendants()) do
-                                    if part:IsA("BasePart") and oldBoardParts[part] == nil
-                                        and (part.Position - hrpPos).Magnitude <= 55 then
-                                        oldBoardParts[part] = part.CanCollide
-                                        part.CanCollide = false
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end)
-                task.wait(0.25)
-            end
-            restoreBoards()
-            running = false
-        end)
-    end
-
-    ASTER.Tabs.Automation:AddToggle("Old Boards (atravesar)", true, function(v)
-        Settings.OldBoardsPass = v == true
-        if v then
-            startBoards()
-        end
-    end)
-    startBoards()
-end
-
--- [[ FARM: Auto Plant / Auto Harvest / Pickup Aura (menú) ]] --
-do
-    local CFG = __ASTER_RUNTIME.FarmCfg
-    local lists = __ASTER_RUNTIME.FarmLists
-    local function selectedList(sel, order)
-        local out = {}
-        for _, name in ipairs(order) do
-            if sel[name] then table.insert(out, name) end
-        end
-        return out
-    end
-
-    ASTER.Tabs.Automation:AddLabel("Farm (Plant / Harvest / Pickup)")
-    ASTER.Tabs.Automation:AddToggle("Farm: Auto Plant", CFG.AutoPlant, function(v) CFG.AutoPlant = v == true end)
-    ASTER.Tabs.Automation:AddToggle("Farm: Auto Harvest", CFG.AutoHarvest, function(v) CFG.AutoHarvest = v == true end)
-    ASTER.Tabs.Automation:AddToggle("Farm: Auto Pickup", CFG.AutoPickup, function(v) CFG.AutoPickup = v == true end)
-    ASTER.Tabs.Automation:AddToggle("Farm: Pickup Cofres", CFG.PickupChests, function(v) CFG.PickupChests = v == true end)
-    ASTER.Tabs.Automation:AddToggle("Farm: Auto Move", CFG.AutoMove, function(v) CFG.AutoMove = v == true end)
-    ASTER.Tabs.Automation:AddMultiDropdown("Farm: Fruta", lists.FRUITS, CFG.PlantItems, function(sel)
-        CFG.PlantItems = selectedList(sel, lists.FRUITS)
-    end)
-    ASTER.Tabs.Automation:AddMultiDropdown("Farm: Items", lists.ITEMS, CFG.PickupTargets, function(sel)
-        if sel.All then
-            CFG.PickupTargets = { "All" }
-        else
-            CFG.PickupTargets = selectedList(sel, lists.ITEMS)
-        end
-    end)
-    ASTER.Tabs.Automation:AddSlider("Farm: Rango recoger", 1, 25, CFG.PickupRange, 1, function(v) CFG.PickupRange = v end)
-    ASTER.Tabs.Automation:AddSlider("Farm: Delay recoger", 0, 5, CFG.PickupDelay, 0.05, function(v) CFG.PickupDelay = v end)
-    ASTER.Tabs.Automation:AddSlider("Farm: Acciones por tanda", 1, 8, CFG.ActionsPerTick, 1, function(v) CFG.ActionsPerTick = math.floor(v + 0.5) end)
-    ASTER.Tabs.Automation:AddSlider("Farm: Delay plantar", 0.01, 0.5, CFG.ActionDelay, 0.01, function(v) CFG.ActionDelay = v end)
-end
-Settings.GoldAutoEquip = true
-ASTER.Tabs.Automation:AddToggle("Gold AutoTool Equip", true, function(v)
-    Settings.GoldAutoEquip = v == true
-    if v then
-        startGoldEquipManager()
-    end
-end)
-local hoeOptions = { "Wood Hoe", "God Hoe", "Crystal Hoe" }
-Settings.GoldHoeType = "Crystal Hoe"
-local hoeDefault = Settings.GoldHoeType or "Wood Hoe"
-local hoeListed = false
-for _, h in ipairs(hoeOptions) do
-    if h == hoeDefault then hoeListed = true break end
-end
-if not hoeListed then hoeDefault = "Wood Hoe" end
-ASTER.Tabs.Automation:AddDropdown("Select Hoe", hoeOptions, hoeDefault, function(v)
-    Settings.GoldHoeType = v
-end)
-
-ASTER.Tabs.Automation:AddLabel("Fuel / Utilities")
-Settings.AutoFuelOpenMenu = true
-Settings.AutoFuelHideMenu = true
-Settings.AutoFuelDirect = true
-ASTER.Tabs.Automation:AddToggle("Fuel Direct (sin menu)", true, function(v)
-    Settings.AutoFuelDirect = v
-end)
-ASTER.Tabs.Automation:AddToggle("Auto Open Campfire Menu", true, function(v)
-    Settings.AutoFuelOpenMenu = v
-end)
-ASTER.Tabs.Automation:AddToggle("Hide Campfire Menu", true, function(v)
-    Settings.AutoFuelHideMenu = v
-end)
-Settings.AutoFuelEnabled = true
-ASTER.Tabs.Automation:AddToggle("Auto Fuel Campfire", true, function(v)
-    Settings.AutoFuelEnabled = v
-    if v then startAutoFuel() end
-end)
-ASTER.Tabs.Automation:AddDropdown("Fuel Type", {"Wood", "Log", "Leaves", "Coal", "All (Wood/Log/Leaves)"}, "All (Wood/Log/Leaves)", function(v)
-    Settings.FuelType = v
-end)
-Settings.FuelThreshold = 250
-ASTER.Tabs.Automation:AddSlider("Fuel Threshold", 0, 250, 250, 1, function(v)
-    Settings.FuelThreshold = v
-end)
-Settings.FuelFeeds = 2
-Settings.FuelRange = 30
-Settings.FuelAllNearby = true
-ASTER.Tabs.Automation:AddSlider("Fuel Feeds At Once", 1, 6, 2, 1, function(v)
-    Settings.FuelFeeds = math.floor(v + 0.5)
-end)
-ASTER.Tabs.Automation:AddSlider("Fuel Range (studs)", 10, 60, 30, 1, function(v)
-    Settings.FuelRange = v
-end)
-ASTER.Tabs.Automation:AddToggle("Fuel All Nearby Campfires", true, function(v)
-    Settings.FuelAllNearby = v
-end)
-
-task.defer(function()
-    if Settings.AutoEatEnabled then startAutoEat() end
-    if Settings.WasteFruitsEnabled then _startWasteOnce() end
-    if Settings.GoldAutoEquip then pcall(startGoldEquipManager) end
-    if Settings.AutoFuelEnabled then pcall(startAutoFuel) end
-    if Settings.AutoRespawnEnabled then pcall(startAutoRespawn) end
-end)
-
-do
-    local hudGui = Instance.new("ScreenGui")
-    hudGui.Name = "ASTER_HUD"
-    hudGui.ResetOnSpawn = false
-    hudGui.DisplayOrder = 50
-    hudGui.Parent = getAsterHiddenUI()
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 200, 0, 190)
-    frame.Position = UDim2.new(0, 74, 0, 2)
-    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    frame.BackgroundTransparency = 0.25
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Parent = hudGui
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = frame
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(150, 110, 255)
-    stroke.Thickness = 1.2
-    stroke.Parent = frame
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -12, 1, -88)
-    label.Position = UDim2.new(0, 8, 0, 4)
-    label.BackgroundTransparency = 1
-    label.TextColor3 = Color3.fromRGB(235, 225, 255)
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextYAlignment = Enum.TextYAlignment.Top
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 19
-    label.Text = "..."
-    label.Parent = frame
-
-    -- botón Ruta: ON = camina por la ruta (igual que "Start Tween" del menú), OFF = se detiene
-    local routeBtn = Instance.new("TextButton")
-    routeBtn.Size = UDim2.new(1, -16, 0, 30)
-    routeBtn.Position = UDim2.new(0, 8, 1, -76)
-    routeBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    routeBtn.TextColor3 = Color3.new(1, 1, 1)
-    routeBtn.Font = Enum.Font.GothamBold
-    routeBtn.TextSize = 16
-    routeBtn.AutoButtonColor = false
-    routeBtn.Text = "Ruta: OFF"
-    routeBtn.Parent = frame
-    Instance.new("UICorner", routeBtn).CornerRadius = UDim.new(0, 6)
-
-    -- boton para elegir el cofre (Items Into Chest)
-    local chestBtn = Instance.new("TextButton")
-    chestBtn.Size = UDim2.new(1, -16, 0, 30)
-    chestBtn.Position = UDim2.new(0, 8, 1, -38)
-    chestBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    chestBtn.TextColor3 = Color3.new(1, 1, 1)
-    chestBtn.Font = Enum.Font.GothamBold
-    chestBtn.TextSize = 15
-    chestBtn.AutoButtonColor = false
-    chestBtn.Text = "Elegir cofre"
-    chestBtn.Parent = frame
-    Instance.new("UICorner", chestBtn).CornerRadius = UDim.new(0, 6)
-    local function refreshChestBtn()
-        local IT = ItemTools
-        if not IT then return end
-        if IT.selecting then
-            chestBtn.Text = "Toca un cofre..."
-            chestBtn.BackgroundColor3 = Color3.fromRGB(110, 50, 190)
-        elseif IT.selectedChest and IT.selectedChest.Parent then
-            chestBtn.Text = "Cofre: " .. IT.selectedChest.Name
-            chestBtn.BackgroundColor3 = Color3.fromRGB(50, 90, 60)
-        else
-            chestBtn.Text = "Elegir cofre"
-            chestBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-        end
-    end
-    chestBtn.Activated:Connect(function()
-        local IT = ItemTools
-        if not IT then return end
-        IT.setSelecting(not IT.selecting)
-        refreshChestBtn()
-    end)
-    local function routeReg()
-        return Window and Window.ElementRegistry and Window.ElementRegistry["Start Tween"]
-    end
-    local function routeOn()
-        local reg = routeReg()
-        if reg and reg.GetValue then return reg.GetValue() == true end
-        return Settings.GoldCircuitEnabled == true
-    end
-    local function refreshRouteBtn()
-        local on = routeOn()
-        routeBtn.Text = "Ruta: " .. (on and "ON" or "OFF")
-        routeBtn.BackgroundColor3 = on and Color3.fromRGB(110, 50, 190) or Color3.fromRGB(35, 35, 40)
-    end
-    routeBtn.Activated:Connect(function()
-        local want = not routeOn()
-        local reg = routeReg()
-        if reg and reg.SetValue then pcall(reg.SetValue, want) end
-        if (Settings.GoldCircuitEnabled == true) ~= want then
-            Settings.GoldCircuitEnabled = want
-            if want then startGoldCircuit() else stopGoldCircuit() end
-        end
-        refreshRouteBtn()
-    end)
-
-    local dragging, dragStart, startPos
-    frame.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging, dragStart, startPos = true, input.Position, frame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
-            local d = input.Position - dragStart
-            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
-    end)
-
-    local frames, fps = 0, 0
-    game:GetService("RunService").RenderStepped:Connect(function() frames = frames + 1 end)
-    local t0 = os.clock()
-    local fpsT = os.clock()
-    local function fmtTime(sec)
-        sec = math.floor(sec)
-        return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
-    end
-    local function count(name)
-        local ok, slot, n = pcall(getInventorySlotAndCount, name)
-        if ok and slot then return n or 0 end
-        return 0
-    end
-    local function fmtNum(n)
-        local s = tostring(math.floor(n))
-        local out = s:reverse():gsub("(%d%d%d)", "%1."):reverse()
-        if out:sub(1, 1) == "." then out = out:sub(2) end
-        return out
-    end
-    task.spawn(function()
-        while hudGui.Parent do
-            local now = os.clock()
-            if now - fpsT >= 1 then
-                fps = math.floor(frames / (now - fpsT) + 0.5)
-                frames, fpsT = 0, now
-            end
-            pcall(function()
-                label.Text = "Tiempo: " .. fmtTime(now - t0)
-                    .. "\nFPS: " .. fps
-                    .. "\nOro: " .. fmtNum(count("Gold"))
-                    .. "\nBluefruit: " .. fmtNum(count("Bluefruit"))
-                refreshRouteBtn()
-                refreshChestBtn()
-            end)
-            task.wait(0.5)
-        end
-    end)
-    Settings.ShowHUD = true
-    ASTER.Tabs.Automation:AddToggle("Show HUD (tiempo/FPS/items)", true, function(v)
-        Settings.ShowHUD = v
-        hudGui.Enabled = v
-    end)
-end
-
--- ============================================================
--- 12a. GOLD & PATHS UI (Gold Farm, Path Management, Waypoint Editor, Path Recorder)
--- ============================================================
-ASTER.Tabs.Main:AddLabel("Gold Farm")
-
-        ASTER.Tabs.Main:AddButton("LoadFreeGoldTween", function()
-
-            local freeTweenData = [[
-      {"positions":[{"Y":-35.001529693603519,"X":-111.23822784423828,"Z":-150.322998046875},{"Y":-33.06850051879883,"X":-150.28334045410157,"Z":-157.5271759033203,"waitTime":2.25},{"Y":-24.904457092285158,"X":-101.6497573852539,"Z":-176.8410186767578,"waitTime":2.25},{"Y":-16.217544555664064,"X":-129.49168395996095,"Z":-200.48655700683595,"waitTime":2.25},{"Y":-2.9872117042541506,"X":-109.68980407714844,"Z":-205.92343139648438},{"Y":-5.478652000427246,"X":-73.75923156738281,"Z":-165.41680908203126},{"Y":-2.54052996635437,"X":-47.84952926635742,"Z":-139.95700073242188},{"Y":-4.201225757598877,"X":-1.476401925086975,"Z":-114.92327880859375},{"Y":-3.000000476837158,"X":59.00017166137695,"Z":-83.25040435791016},{"Y":-3.594053030014038,"X":105.6518325805664,"Z":-41.69924545288086},{"Y":-3.0652363300323488,"X":134.2716522216797,"Z":-14.063572883605957},{"Y":-3.000000476837158,"X":222.952392578125,"Z":71.56534576416016},{"Y":-4.5299248695373539,"X":257.8995056152344,"Z":98.70545196533203},{"Y":-10.744340896606446,"X":293.61883544921877,"Z":121.47196960449219},{"Y":-3.8026249408721926,"X":344.6594543457031,"Z":153.6503143310547},{"Y":-3.000000476837158,"X":422.6432800292969,"Z":213.8682098388672},{"Y":-3.000000476837158,"X":441.91619873046877,"Z":227.66021728515626},{"Y":9.237739562988282,"X":450.6335754394531,"Z":233.390380859375},{"Y":13.820841789245606,"X":459.837646484375,"Z":248.66470336914063},{"Y":13.791736602783204,"X":473.9879150390625,"Z":208.55780029296876},{"Y":16.7873477935791,"X":477.49310302734377,"Z":191.6634979248047},{"Y":14.420902252197266,"X":468.1609191894531,"Z":154.39776611328126},{"Y":12.920480728149414,"X":500.728759765625,"Z":152.8026123046875},{"Y":-0.45536714792251589,"X":507.9001770019531,"Z":139.3783416748047},{"Y":-4.485151290893555,"X":526.7735595703125,"Z":107.79975128173828},{"Y":-11.092853546142579,"X":537.4927368164063,"Z":92.56905364990235},{"Y":-11.00516414642334,"X":559.0673217773438,"Z":41.365013122558597},{"Y":-11.543245315551758,"X":588.9154052734375,"Z":-32.28464889526367},{"Y":-8.54233169555664,"X":620.0653076171875,"Z":-105.294677734375},{"Y":-4.2826666831970219,"X":623.614013671875,"Z":-112.19488525390625},{"Y":-3.5430808067321779,"X":636.2014770507813,"Z":-146.62120056152345},{"Y":9.257548332214356,"X":640.1133422851563,"Z":-157.56373596191407},{"Y":23.890247344970704,"X":642.64013671875,"Z":-163.6774444580078},{"Y":31.053882598876954,"X":652.4203491210938,"Z":-172.4340057373047},{"Y":32.81493377685547,"X":663.3070068359375,"waitTime":0.22,"Z":-184.99884033203126},{"Y":48.18572235107422,"X":662.0396118164063,"Z":-194.4517364501953},{"Y":59.13154220581055,"X":649.7789306640625,"Z":-203.70794677734376},{"Y":69.12764739990235,"X":641.0880737304688,"Z":-210.55557250976563},{"Y":70.15151977539063,"X":638.1156005859375,"Z":-222.9108123779297},{"Y":68.10548400878906,"X":636.825439453125,"Z":-237.23130798339845},{"Y":60.8437614440918,"X":642.8209228515625,"Z":-253.01358032226563},{"Y":61.28973388671875,"X":652.2427978515625,"Z":-266.9076232910156},{"Y":60.53296661376953,"X":653.162109375,"Z":-282.9266052246094},{"Y":54.758602142333987,"X":648.52294921875,"Z":-302.2294921875},{"Y":52.903350830078128,"X":645.8076171875,"Z":-323.3299560546875},{"Y":53.815982818603519,"X":652.6668701171875,"Z":-347.0151062011719},{"Y":60.73252868652344,"X":663.3242797851563,"Z":-361.1748962402344},{"Y":73.63504028320313,"X":669.8377685546875,"Z":-369.90386962890627},{"Y":81.14241027832031,"X":677.5490112304688,"Z":-392.7919921875},{"Y":76.78495025634766,"X":661.2151489257813,"Z":-378.26605224609377},{"Y":64.52510833740235,"X":656.1217041015625,"Z":-376.3868408203125},{"Y":52.97677993774414,"X":645.702880859375,"Z":-371.31817626953127},{"Y":49.01122283935547,"X":631.9244384765625,"Z":-364.15716552734377},{"Y":41.84897994995117,"X":624.0087280273438,"Z":-362.3535461425781},{"Y":35.69752502441406,"X":615.4901733398438,"Z":-359.1184997558594},{"Y":29.094730377197267,"X":594.7220458984375,"Z":-362.3443298339844},{"Y":14.336801528930664,"X":584.0901489257813,"Z":-352.4488220214844},{"Y":10.334908485412598,"X":588.4595336914063,"Z":-351.7544860839844},{"Y":-4.860062599182129,"X":596.1582641601563,"Z":-349.16571044921877},{"Y":-7.396815776824951,"X":614.2924194335938,"waitTime":0.55,"Z":-357.3804626464844},{"Y":-3.537902593612671,"X":644.5868530273438,"Z":-365.5182189941406},{"Y":-7.571692943572998,"X":622.1827392578125,"Z":-382.667724609375},{"Y":-4.801229953765869,"X":613.672607421875,"Z":-391.78790283203127},{"Y":-4.90981912612915,"X":603.9226684570313,"Z":-382.5379638671875},{"Y":-1.5201094150543213,"X":586.2009887695313,"Z":-385.5180969238281},{"Y":6.9607014656066898,"X":573.9547729492188,"Z":-390.1113586425781},{"Y":12.069486618041993,"X":556.332763671875,"Z":-394.60400390625},{"Y":10.37628173828125,"X":540.7774658203125,"Z":-398.99322509765627},{"Y":4.5449981689453129,"X":529.14013671875,"Z":-400.5452880859375},{"Y":-3.019165515899658,"X":516.6317138671875,"Z":-400.4026794433594},{"Y":-4.804425239562988,"X":496.52886962890627,"Z":-398.82806396484377},{"Y":-10.353181838989258,"X":475.0547790527344,"Z":-400.9407958984375},{"Y":-10.959868431091309,"X":419.3533630371094,"Z":-581.047119140625},{"Y":-4.515384197235107,"X":447.6380615234375,"Z":-702.4669189453125},{"Y":-4.176120758056641,"X":435.8458251953125,"Z":-755.040283203125},{"Y":-15.457039833068848,"X":445.1316223144531,"Z":-753.1762084960938},{"Y":-28.351383209228517,"X":454.53192138671877,"Z":-759.3656616210938},{"Y":-32.352237701416019,"X":493.59033203125,"Z":-775.359130859375},{"Y":-35.03931427001953,"X":558.8375854492188,"Z":-757.4616088867188},{"Y":-33.095401763916019,"X":498.7996826171875,"Z":-777.1038208007813},{"Y":-32.94096755981445,"X":457.7084655761719,"Z":-757.65234375},{"Y":-20.382261276245118,"X":446.0972595214844,"Z":-754.4138793945313},{"Y":-4.416776180267334,"X":442.45281982421877,"Z":-754.048828125},{"Y":-3.0023162364959719,"X":422.19232177734377,"Z":-737.184814453125},{"Y":-5.76387882232666,"X":336.8083801269531,"Z":-715.814208984375},{"Y":-4.508203029632568,"X":177.21163940429688,"Z":-665.2991333007813},{"Y":-5.106081485748291,"X":94.67057800292969,"Z":-641.0780029296875},{"Y":-7.1703643798828129,"X":-72.0772476196289,"Z":-593.5692138671875},{"Y":-3.000000238418579,"X":-147.05799865722657,"Z":-620.1271362304688},{"Y":1.9939298629760743,"X":-192.12799072265626,"Z":-630.8121948242188},{"Y":22.409631729125978,"X":-206.55642700195313,"Z":-626.6513671875},{"Y":22.97821044921875,"X":-218.359130859375,"Z":-627.5806274414063},{"Y":5.354426860809326,"X":-226.0176544189453,"Z":-628.6981811523438},{"Y":-2.548158645629883,"X":-246.69288635253907,"Z":-623.3795166015625},{"Y":-3.0697176456451418,"X":-359.675537109375,"Z":-555.3429565429688},{"Y":-4.495460510253906,"X":-513.1705322265625,"Z":-502.7482604980469},{"Y":-4.86066198348999,"X":-617.6412353515625,"Z":-483.80157470703127},{"Y":-11.400009155273438,"X":-712.8392333984375,"Z":-457.2956237792969},{"Y":-7.471586227416992,"X":-811.6539306640625,"Z":-430.55804443359377},{"Y":-0.08951032161712647,"X":-846.9163818359375,"Z":-419.21368408203127},{"Y":9.093318939208985,"X":-875.843994140625,"Z":-419.2531433105469},{"Y":6.912939548492432,"X":-910.7113647460938,"Z":-404.67645263671877},{"Y":12.279690742492676,"X":-873.6814575195313,"Z":-419.9178161621094},{"Y":-7.145095348358154,"X":-834.7574462890625,"Z":-420.2413635253906},{"Y":-5.80037784576416,"X":-606.1832885742188,"Z":-474.835205078125},{"Y":-3.2188401222229006,"X":-419.3578796386719,"Z":-578.7322998046875},{"Y":-31.274709701538087,"X":-414.1717529296875,"Z":-574.5009765625},{"Y":-39.172325134277347,"X":-403.7130126953125,"Z":-550.8300170898438},{"Y":-43.13996505737305,"X":-390.6006164550781,"Z":-556.5234375},{"Y":-49.78067398071289,"X":-314.4368591308594,"Z":-569.5720825195313},{"Y":-56.79861068725586,"X":-253.19235229492188,"Z":-552.5960693359375},{"Y":-60.138118743896487,"X":-200.3426971435547,"Z":-535.1206665039063},{"Y":-62.65102767944336,"X":-161.09600830078126,"Z":-584.2384033203125},{"Y":-59.62028121948242,"X":-213.6802978515625,"Z":-633.1117553710938},{"Y":-63.866451263427737,"X":-176.5718536376953,"Z":-604.4242553710938},{"Y":-63.758480072021487,"X":-172.54689025878907,"Z":-581.6828002929688},{"Y":-63.337005615234378,"X":-175.91639709472657,"Z":-548.1791381835938},{"Y":-63.47652816772461,"X":-167.20986938476563,"Z":-526.0902099609375},{"Y":-63.031063079833987,"X":-169.10536193847657,"Z":-499.32818603515627},{"Y":-67.02882385253906,"X":-179.11900329589845,"Z":-475.46307373046877},{"Y":-70.55829620361328,"X":-179.87303161621095,"Z":-441.720947265625},{"Y":-77.9665298461914,"X":-174.41151428222657,"Z":-434.15374755859377},{"Y":-89.22174072265625,"X":-171.1572723388672,"Z":-438.45751953125},{"Y":-96.07298278808594,"X":-171.1572723388672,"Z":-438.45751953125},{"Y":-98.19011688232422,"X":-165.72308349609376,"Z":-449.9311218261719},{"Y":-102.99935150146485,"X":-153.114990234375,"Z":-461.7033386230469},{"Y":-99.103515625,"X":-154.4361114501953,"Z":-481.4436340332031},{"Y":-98.79793548583985,"X":-160.646240234375,"Z":-495.2094421386719},{"Y":-99.49816131591797,"X":-165.18618774414063,"Z":-503.30230712890627},{"Y":-103.00001525878906,"X":-186.71578979492188,"Z":-506.4983215332031},{"Y":-103.27188873291016,"X":-195.58457946777345,"Z":-496.19268798828127},{"Y":-103.44387817382813,"X":-191.13531494140626,"Z":-471.20703125},{"Y":-100.76580047607422,"X":-191.9467010498047,"waitTime":0.44,"Z":-449.3254089355469},{"Y":-103.40946197509766,"X":-190.7568817138672,"Z":-472.4533386230469},{"Y":-103.00000762939453,"X":-193.971435546875,"Z":-484.4539794921875},{"Y":-103.25475311279297,"X":-196.7699432373047,"Z":-495.9251708984375},{"Y":-103.09420776367188,"X":-185.9100799560547,"Z":-504.7077941894531},{"Y":-101.96617889404297,"X":-174.6333465576172,"Z":-506.0704650878906},{"Y":-98.9635009765625,"X":-167.57569885253907,"Z":-502.52386474609377},{"Y":-99.83893585205078,"X":-158.58596801757813,"Z":-497.6114807128906},{"Y":-97.93701934814453,"X":-145.60678100585938,"Z":-493.8856201171875},{"Y":-103.00001525878906,"X":-133.62059020996095,"Z":-493.56024169921877},{"Y":-103.00001525878906,"X":-115.6190414428711,"Z":-484.083984375},{"Y":-103.00001525878906,"X":-62.597782135009769,"Z":-468.059326171875},{"Y":-103.0001220703125,"X":-26.971569061279298,"Z":-446.7550048828125},{"Y":-102.93307495117188,"X":12.651388168334961,"Z":-416.4880676269531},{"Y":-99.44232177734375,"X":18.780681610107423,"Z":-406.5196838378906},{"Y":-99.00000762939453,"X":19.878032684326173,"Z":-388.8252868652344},{"Y":-99.25630950927735,"X":54.88884735107422,"waitTime":0.38,"Z":-351.56964111328127},{"Y":-99.00001525878906,"X":23.38662338256836,"Z":-383.5782775878906},{"Y":-99.28409576416016,"X":19.029319763183595,"Z":-404.92303466796877},{"Y":-103.00000762939453,"X":5.616722106933594,"Z":-416.9212951660156},{"Y":-103.24381256103516,"X":-46.93764877319336,"Z":-395.05572509765627},{"Y":-107.52904510498047,"X":-66.43094635009766,"Z":-381.4445495605469},{"Y":-103.82237243652344,"X":-86.76270294189453,"Z":-364.6119079589844},{"Y":-103.00001525878906,"X":-104.35830688476563,"Z":-347.22454833984377},{"Y":-99.75321960449219,"X":-109.04177856445313,"Z":-331.54412841796877},{"Y":-95.62533569335938,"X":-111.85131072998047,"Z":-313.1513671875},{"Y":-91.3089828491211,"X":-116.9298324584961,"Z":-291.8326110839844},{"Y":-87.29109191894531,"X":-135.14842224121095,"Z":-289.55859375},{"Y":-84.83995056152344,"X":-141.61415100097657,"Z":-291.59820556640627},{"Y":-84.6835708618164,"X":-152.28546142578126,"Z":-299.0233459472656},{"Y":-81.37537384033203,"X":-162.46849060058595,"Z":-311.5071716308594},{"Y":-76.61341094970703,"X":-167.87637329101563,"Z":-318.8341369628906},{"Y":-78.74473571777344,"X":-176.8583221435547,"Z":-317.3970947265625},{"Y":-77.18473815917969,"X":-185.7606201171875,"Z":-317.43902587890627},{"Y":-76.25244140625,"X":-198.16317749023438,"Z":-311.0343017578125},{"Y":-76.2488784790039,"X":-202.3442840576172,"Z":-305.9037170410156},{"Y":-76.32604217529297,"X":-212.91354370117188,"Z":-308.782958984375},{"Y":-78.92567443847656,"X":-221.00270080566407,"Z":-305.8204040527344},{"Y":-79.00000762939453,"X":-236.7618865966797,"Z":-314.0966796875},{"Y":-76.41073608398438,"X":-243.42208862304688,"Z":-326.4620361328125},{"Y":-79.00001525878906,"X":-260.8531799316406,"Z":-345.6808166503906},{"Y":-77.24800109863281,"X":-275.2143249511719,"Z":-350.6474914550781},{"Y":-76.12911987304688,"X":-294.4759826660156,"Z":-363.3056640625},{"Y":-79.00001525878906,"X":-319.6708984375,"Z":-370.8691101074219},{"Y":-76.38452911376953,"X":-294.5587463378906,"Z":-362.0054931640625},{"Y":-77.07986450195313,"X":-275.4173583984375,"Z":-349.7216796875},{"Y":-75.58771514892578,"X":-259.8752136230469,"Z":-332.2989807128906},{"Y":-76.162841796875,"X":-249.27874755859376,"Z":-317.2018127441406},{"Y":-76.66788482666016,"X":-239.51731872558595,"Z":-297.7491455078125},{"Y":-79.10919952392578,"X":-235.02456665039063,"Z":-282.1385803222656},{"Y":-83.05184936523438,"X":-227.9050750732422,"Z":-259.0917053222656},{"Y":-83.00000762939453,"X":-248.8055877685547,"waitTime":0.22,"Z":-238.42636108398438},{"Y":-81.55177307128906,"X":-238.601806640625,"Z":-231.60491943359376},{"Y":-89.23003387451172,"X":-230.36598205566407,"Z":-217.19810485839845},{"Y":-96.2680435180664,"X":-225.45082092285157,"Z":-211.4920196533203},{"Y":-100.04280090332031,"X":-219.2681884765625,"Z":-201.77084350585938},{"Y":-95.66956329345703,"X":-214.68360900878907,"Z":-181.3822479248047},{"Y":-95.41595458984375,"X":-216.781982421875,"Z":-159.4675750732422},{"Y":-95.87269592285156,"X":-231.07379150390626,"Z":-138.62875366210938},{"Y":-94.74500274658203,"X":-249.0113983154297,"Z":-118.37271118164063},{"Y":-99.81652069091797,"X":-261.99542236328127,"Z":-98.20941162109375},{"Y":-98.55552673339844,"X":-279.041259765625,"Z":-85.19420623779297},{"Y":-95.55258178710938,"X":-290.6869812011719,"Z":-82.38420104980469},{"Y":-95.81491088867188,"X":-310.9895935058594,"Z":-70.90158081054688},{"Y":-92.24469757080078,"X":-321.6689758300781,"Z":-61.269649505615237},{"Y":-91.01455688476563,"X":-348.47467041015627,"Z":-42.22124481201172},{"Y":-91.01564025878906,"X":-329.1878662109375,"Z":-60.129539489746097},{"Y":-89.2813720703125,"X":-327.09100341796877,"Z":-87.0484619140625},{"Y":-84.779296875,"X":-326.7738037109375,"Z":-105.6436767578125},{"Y":-81.99109649658203,"X":-313.77325439453127,"Z":-113.155517578125},{"Y":-76.67230987548828,"X":-306.28253173828127,"Z":-100.8621826171875},{"Y":-72.28472900390625,"X":-291.4124755859375,"Z":-92.3910903930664},{"Y":-69.98668670654297,"X":-270.7921447753906,"Z":-84.01844024658203},{"Y":-71.3525619506836,"X":-251.85108947753907,"Z":-76.48330688476563},{"Y":-71.50276184082031,"X":-227.06439208984376,"Z":-80.39768981933594},{"Y":-71.39520263671875,"X":-251.31092834472657,"Z":-76.3059310913086},{"Y":-71.77449035644531,"X":-267.32720947265627,"Z":-78.61320495605469},{"Y":-74.24156951904297,"X":-272.4139099121094,"Z":-71.63211059570313},{"Y":-95.11537170410156,"X":-272.41387939453127,"Z":-71.63219451904297},{"Y":-97.61564636230469,"X":-262.960693359375,"Z":-88.22897338867188},{"Y":-96.93684387207031,"X":-255.78611755371095,"Z":-105.40406036376953},{"Y":-95.53997802734375,"X":-245.83120727539063,"Z":-129.09695434570313},{"Y":-95.3421630859375,"X":-223.02499389648438,"Z":-128.52000427246095},{"Y":-95.39652252197266,"X":-194.21530151367188,"Z":-107.40668487548828},{"Y":-95.34446716308594,"X":-168.48194885253907,"Z":-81.80047607421875},{"Y":-95.1644515991211,"X":-135.31626892089845,"Z":-49.0128288269043},{"Y":-95.0000228881836,"X":-85.32303619384766,"Z":-29.351627349853517},{"Y":-94.53833770751953,"X":-46.698726654052737,"Z":-21.259023666381837},{"Y":-95.28936004638672,"X":-37.33900833129883,"Z":-5.386425018310547},{"Y":-91.03485107421875,"X":-16.075149536132814,"Z":2.6994011402130129},{"Y":-95.60102844238281,"X":-37.947628021240237,"Z":-5.051972389221191},{"Y":-95.2696762084961,"X":-45.24357986450195,"Z":-24.214237213134767},{"Y":-95.4957275390625,"X":-62.157100677490237,"Z":-41.16522979736328},{"Y":-91.04135131835938,"X":-66.486572265625,"Z":-51.317718505859378},{"Y":-84.86607360839844,"X":-69.42887878417969,"Z":-67.7758560180664},{"Y":-76.93339538574219,"X":-59.070919036865237,"Z":-74.51922607421875},{"Y":-75.00001525878906,"X":-43.24739456176758,"Z":-69.53412628173828},{"Y":-75.00153350830078,"X":-28.057456970214845,"Z":-52.418975830078128},{"Y":-76.69026184082031,"X":-20.81903648376465,"Z":-35.50608825683594},{"Y":-75.00000762939453,"X":7.851291179656982,"Z":-37.161190032958987},{"Y":-74.8431625366211,"X":10.23601245880127,"Z":-58.23441696166992},{"Y":-82.66648864746094,"X":1.4306410551071168,"waitTime":0.22,"Z":-77.75659942626953},{"Y":-76.63348388671875,"X":4.449407577514648,"Z":-93.93130493164063},{"Y":-70.80943298339844,"X":17.122955322265626,"Z":-111.96417236328125},{"Y":-74.87031555175781,"X":28.483449935913087,"Z":-117.97529602050781},{"Y":-75.06192779541016,"X":52.7962646484375,"Z":-134.030517578125},{"Y":-75.39938354492188,"X":71.35850524902344,"Z":-132.94090270996095},{"Y":-71.61602783203125,"X":78.34840393066406,"Z":-115.8716049194336},{"Y":-64.16116333007813,"X":81.9723129272461,"Z":-94.35904693603516},{"Y":-56.39702224731445,"X":78.27147674560547,"Z":-74.16580200195313},{"Y":-49.728294372558597,"X":71.36261749267578,"Z":-62.59131622314453},{"Y":-41.35995864868164,"X":55.369937896728519,"Z":-53.88125228881836},{"Y":-36.20464324951172,"X":43.80089569091797,"Z":-55.62546157836914},{"Y":-35.000003814697269,"X":9.312958717346192,"Z":-71.48139190673828},{"Y":-35.02860641479492,"X":-25.761381149291993,"Z":-86.60227966308594},{"Y":-35.22578811645508,"X":-57.334415435791019,"Z":-103.92764282226563},{"Y":-35.13738250732422,"X":-81.48953247070313,"Z":-135.73748779296876}]}
-            ]]
-
-            local success, decoded = pcall(function()
-                return game:GetService("HttpService"):JSONDecode(freeTweenData)
-            end)
-
-            if success and decoded and decoded.positions then
-
-                Settings.recordedPositions = decoded.positions
-
-                if updateVisualNodes then
-                    updateVisualNodes()
-                end
-
-                if ASTER.Options.WaypointDropdown and ASTER.getWaypointList then
-                    ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-                    ASTER.Options.WaypointDropdown:SetValue("None")
-                end
-            else
-                warn("Failed to load Free Tween coordinates. Make sure the JSON format is correct.")
-            end
-        end)
-
-    ASTER.Tabs.Main:AddToggle("Start Tween", false, function(v)
+    WaypointUI:AddLabel("Gold Farm")
+    WaypointUI:AddToggle("Start Tween", false, function(v)
             Settings.GoldCircuitEnabled = v
             if v then
                 startGoldCircuit()
@@ -4069,77 +1379,57 @@ ASTER.Tabs.Main:AddLabel("Gold Farm")
                 stopGoldCircuit()
             end
         end)
-    ASTER.Tabs.Main:AddSlider("Tween Speed", 1, 21, 18, 1, function(v)
-        Settings.GoldSpeed = v
-        WALK_SPEED = v
+    WaypointUI:AddSlider("Tween Speed", 1, GOLD_SPEED_MAX, math.clamp(tonumber(Settings.GoldSpeed) or 16, 1, GOLD_SPEED_MAX), 1, function(v)
+        Settings.GoldSpeed = math.clamp(tonumber(v) or 16, 1, GOLD_SPEED_MAX)
+        WALK_SPEED = Settings.GoldSpeed
     end)
-WALK_SPEED = 18
-Settings.GoldSpeed = 18
-    ASTER.Tabs.Main:AddSlider("Gold Delay", 0, 2, 0.75, 0.01, function(v)
-        Settings.GoldDelay = v
+    WaypointUI:AddSlider("Gold Delay", 0, 2, math.max(tonumber(Settings.GoldDelay) or 0, 0), 0.01, function(v) 
+        Settings.GoldDelay = math.max(tonumber(v) or 0, 0)
     end)
-    ASTER.Tabs.Main:AddToggle("Gold Wait Until Mined", true, function(v)
+    WaypointUI:AddToggle("Gold Wait Until Mined", Settings.GoldWaitUntilMined, function(v)
         Settings.GoldWaitUntilMined = v == true
     end)
-    ASTER.Tabs.Main:AddSlider("Gold Max Wait", 3, 60, 20, 1, function(v)
+    WaypointUI:AddSlider("Gold Max Wait", 3, 60, Settings.GoldMaxWait, 1, function(v)
         Settings.GoldMaxWait = v
     end)
-    Settings.GoldDetectRange = Settings.GoldDetectRange or 14
-    ASTER.Tabs.Main:AddSlider("Gold Detect Range", 5, 80, 14, 1, function(v)
+    WaypointUI:AddSlider("Gold Detect Range", 5, 80, Settings.GoldDetectRange, 1, function(v)
         Settings.GoldDetectRange = v
     end)
-    ASTER.Tabs.Main:AddToggle("Visual Waypoints", false, function(v)
+    WaypointUI:AddToggle("Visual Waypoints", false, function(v)
         Settings.GoldVisual = v
         updateVisualNodes()
     end)
-    ASTER.Tabs.Main:AddToggle("Tween Only (Recommended)", false, function(v)
+    WaypointUI:AddToggle("Tween Only (Recommended)", false, function(v)
         Settings.TweenOnly = v
     end)
-do
-    ASTER.Tabs.Main:AddLabel("Path Management")
+end
 
-    local EMBEDDED_ROUTE_NAME = "5"
-    local EMBEDDED_ROUTE_JSON = [==[{"positions":[{"Y":-35.200172424316409,"X":-127.11538696289063,"Z":-145.9087677001953},{"Y":-34.95144271850586,"X":-139.791015625,"Z":-166.66966247558595},{"Y":-33.932823181152347,"X":-143.31504821777345,"Z":-174.77394104003907},{"Y":-24.487215042114259,"X":-146.63343811035157,"Z":-183.0042266845703},{"Y":-21.80611228942871,"X":-145.8102264404297,"Z":-190.6520538330078},{"Y":-21.231874465942384,"X":-140.80636596679688,"Z":-194.6387481689453},{"Y":-30.700057983398439,"X":-134.4620361328125,"Z":-193.28271484375},{"Y":-34.18813705444336,"X":-119.94841003417969,"Z":-184.12782287597657},{"Y":-27.441862106323243,"X":-107.3861083984375,"Z":-179.36253356933595},{"Y":-35.000003814697269,"X":-111.82693481445313,"Z":-170.40472412109376},{"Y":-35.000003814697269,"X":-102.82891082763672,"Z":-158.1606903076172},{"Y":-35.04365539550781,"X":-79.27107238769531,"Z":-134.92593383789063},{"Y":-35.58470153808594,"X":-66.32879638671875,"Z":-122.1530990600586},{"Y":-35.5170783996582,"X":-53.25351333618164,"Z":-109.76818084716797},{"Y":-35.00183868408203,"X":-40.08299255371094,"Z":-97.22576141357422},{"Y":-34.93303298950195,"X":-27.127164840698243,"Z":-89.79827880859375},{"Y":-34.93351364135742,"X":-21.820457458496095,"Z":-86.93006896972656},{"Y":-36.629886627197269,"X":-9.874161720275879,"Z":-82.01268005371094},{"Y":-35.2569465637207,"X":-0.84139484167099,"Z":-78.3850326538086},{"Y":-35.000003814697269,"X":12.761099815368653,"Z":-73.31841278076172},{"Y":-35.06589126586914,"X":30.376258850097658,"Z":-66.28913116455078},{"Y":-35.70327377319336,"X":46.45375442504883,"Z":-59.88577651977539},{"Y":-36.68755340576172,"X":48.586692810058597,"Z":-57.912803649902347},{"Y":-39.489681243896487,"X":52.96553421020508,"Z":-58.15285873413086},{"Y":-40.93656921386719,"X":55.84183120727539,"Z":-56.82392501831055},{"Y":-43.84962463378906,"X":59.68125915527344,"Z":-55.80299377441406},{"Y":-47.0460205078125,"X":65.21498107910156,"Z":-57.58531951904297},{"Y":-49.59457778930664,"X":70.40747833251953,"Z":-62.61623764038086},{"Y":-52.42375183105469,"X":72.93911743164063,"Z":-68.62538146972656},{"Y":-55.58892822265625,"X":73.9955825805664,"Z":-74.4384994506836},{"Y":-58.48631286621094,"X":74.8619155883789,"Z":-82.25238037109375},{"Y":-60.21743392944336,"X":76.14430236816406,"Z":-88.4163589477539},{"Y":-62.76438522338867,"X":75.94927978515625,"Z":-93.9295654296875},{"Y":-67.4958267211914,"X":75.43405151367188,"Z":-102.33184051513672},{"Y":-71.19417572021485,"X":74.32842254638672,"Z":-111.22592163085938},{"Y":-72.6788558959961,"X":72.16184997558594,"Z":-120.27828979492188},{"Y":-74.59910583496094,"X":69.00929260253906,"Z":-127.80120849609375},{"Y":-75.33142852783203,"X":62.45353698730469,"Z":-132.5701446533203},{"Y":-75.06645965576172,"X":55.31161880493164,"Z":-133.96084594726563},{"Y":-75.02245330810547,"X":45.38873291015625,"Z":-131.2076416015625},{"Y":-75.00000762939453,"X":37.14619445800781,"Z":-127.24678039550781},{"Y":-75.06132507324219,"X":30.090946197509767,"Z":-121.66617584228516},{"Y":-73.72555541992188,"X":25.417375564575197,"Z":-115.65186309814453},{"Y":-71.57548522949219,"X":21.84725570678711,"Z":-111.4046859741211},{"Y":-71.01688385009766,"X":20.075679779052736,"Z":-108.45911407470703},{"Y":-73.89055633544922,"X":17.89089584350586,"Z":-105.94225311279297},{"Y":-75.9335708618164,"X":13.944907188415528,"Z":-101.83480072021485},{"Y":-77.35223388671875,"X":9.48249626159668,"Z":-96.1761474609375},{"Y":-80.29497528076172,"X":6.815572738647461,"Z":-91.34197235107422},{"Y":-82.97765350341797,"X":2.5394127368927,"Z":-85.17523956298828},{"Y":-82.46599578857422,"X":2.8963072299957277,"Z":-76.65235137939453},{"Y":-80.0101089477539,"X":3.762794256210327,"Z":-69.7983169555664},{"Y":-76.72052001953125,"X":5.379025936126709,"Z":-62.47624969482422},{"Y":-75.27288818359375,"X":10.099550247192383,"Z":-54.472476959228519},{"Y":-75.0504150390625,"X":10.720209121704102,"Z":-43.686126708984378},{"Y":-75.00001525878906,"X":6.5490264892578129,"Z":-36.033077239990237},{"Y":-75.04844665527344,"X":-3.812410831451416,"Z":-35.57367706298828},{"Y":-75.22642517089844,"X":-12.82418441772461,"Z":-36.81919860839844},{"Y":-76.13790130615235,"X":-21.805818557739259,"Z":-40.37363052368164},{"Y":-75.60755157470703,"X":-26.226736068725587,"Z":-44.738040924072269},{"Y":-75.00666809082031,"X":-29.206710815429689,"Z":-52.258182525634769},{"Y":-75.00523376464844,"X":-32.93906784057617,"Z":-58.117095947265628},{"Y":-75.00001525878906,"X":-38.69208908081055,"Z":-63.5067138671875},{"Y":-75.00001525878906,"X":-46.293087005615237,"Z":-69.7999038696289},{"Y":-75.03598022460938,"X":-51.871402740478519,"Z":-72.67539978027344},{"Y":-76.50691986083985,"X":-57.86912155151367,"Z":-74.39759826660156},{"Y":-76.768310546875,"X":-59.6989860534668,"Z":-72.07643127441406},{"Y":-81.54940795898438,"X":-62.4913444519043,"Z":-68.71109008789063},{"Y":-86.79821014404297,"X":-66.00936889648438,"Z":-63.43706512451172},{"Y":-89.3389892578125,"X":-65.81868743896485,"Z":-58.07548522949219},{"Y":-91.11959838867188,"X":-63.7754020690918,"Z":-52.084476470947269},{"Y":-93.72315979003906,"X":-58.788818359375,"Z":-41.79557800292969},{"Y":-95.0779800415039,"X":-55.731990814208987,"Z":-37.97810745239258},{"Y":-95.20124816894531,"X":-50.84624099731445,"Z":-30.932573318481447},{"Y":-94.88368225097656,"X":-42.435638427734378,"Z":-20.83847999572754},{"Y":-95.0985336303711,"X":-39.099605560302737,"Z":-14.353784561157227},{"Y":-92.96502685546875,"X":-27.13096046447754,"Z":-7.563878536224365},{"Y":-94.74370574951172,"X":-31.581300735473634,"Z":-8.698981285095215},{"Y":-95.64067077636719,"X":-38.631568908691409,"Z":-11.226015090942383},{"Y":-94.2427978515625,"X":-44.72114181518555,"Z":-17.788341522216798},{"Y":-94.14376068115235,"X":-46.72057342529297,"Z":-19.713825225830079},{"Y":-94.24919128417969,"X":-50.712520599365237,"Z":-20.590534210205079},{"Y":-95.43464660644531,"X":-56.897579193115237,"Z":-22.239702224731447},{"Y":-95.37749481201172,"X":-65.73574829101563,"Z":-24.502920150756837},{"Y":-95.30870056152344,"X":-94.8011703491211,"Z":-35.28067398071289},{"Y":-95.20991516113281,"X":-94.91608428955078,"Z":-35.32646179199219},{"Y":-95.54659271240235,"X":-110.13668823242188,"Z":-41.50413131713867},{"Y":-95.77704620361328,"X":-134.69406127929688,"Z":-53.21560287475586},{"Y":-95.22758483886719,"X":-143.59364318847657,"Z":-58.47604751586914},{"Y":-95.18110656738281,"X":-157.69981384277345,"Z":-67.83914184570313},{"Y":-95.3884506225586,"X":-172.64215087890626,"Z":-78.48036193847656},{"Y":-95.1025390625,"X":-185.25086975097657,"Z":-88.61800384521485},{"Y":-95.279052734375,"X":-197.35037231445313,"Z":-97.6330795288086},{"Y":-95.00225830078125,"X":-212.23028564453126,"Z":-102.74871063232422},{"Y":-92.31501007080078,"X":-217.47503662109376,"Z":-102.54165649414063},{"Y":-89.30288696289063,"X":-218.878173828125,"Z":-100.1025619506836},{"Y":-87.15621948242188,"X":-222.91090393066407,"Z":-95.8911361694336},{"Y":-86.59174346923828,"X":-227.68800354003907,"Z":-93.44901275634766},{"Y":-86.3244857788086,"X":-230.5103302001953,"Z":-94.38806915283203},{"Y":-85.25167083740235,"X":-234.1280517578125,"Z":-97.63946533203125},{"Y":-85.8358383178711,"X":-233.58213806152345,"Z":-96.22228240966797},{"Y":-87.38932037353516,"X":-236.42755126953126,"Z":-95.23226928710938},{"Y":-89.0209732055664,"X":-239.28489685058595,"Z":-94.67649841308594},{"Y":-92.06761932373047,"X":-242.1452178955078,"Z":-94.63947296142578},{"Y":-95.38704681396485,"X":-246.48294067382813,"Z":-92.98495483398438},{"Y":-95.4490966796875,"X":-253.81304931640626,"Z":-89.554931640625},{"Y":-95.61763000488281,"X":-259.5924072265625,"Z":-87.04479217529297},{"Y":-98.00439453125,"X":-265.4167785644531,"Z":-84.46880340576172},{"Y":-99.26764678955078,"X":-269.61334228515627,"Z":-83.14600372314453},{"Y":-99.02745056152344,"X":-276.0867919921875,"Z":-80.7872314453125},{"Y":-97.94589233398438,"X":-284.9393615722656,"Z":-76.22332763671875},{"Y":-98.90709686279297,"X":-286.6085510253906,"Z":-73.68739318847656},{"Y":-96.06635284423828,"X":-291.0561218261719,"Z":-73.28999328613281},{"Y":-95.18375396728516,"X":-295.9610595703125,"Z":-71.70403289794922},{"Y":-95.1768798828125,"X":-306.4212341308594,"Z":-69.60155487060547},{"Y":-94.3653793334961,"X":-314.003662109375,"Z":-65.5657958984375},{"Y":-91.01563262939453,"X":-332.88671875,"Z":-52.01259231567383},{"Y":-91.01563262939453,"X":-329.99700927734377,"Z":-56.00105285644531},{"Y":-91.6180191040039,"X":-326.5920104980469,"Z":-58.609588623046878},{"Y":-92.00896453857422,"X":-321.955810546875,"Z":-63.44392395019531},{"Y":-94.90386199951172,"X":-317.7585754394531,"Z":-65.9827880859375},{"Y":-94.92790985107422,"X":-312.8907775878906,"Z":-67.85557556152344},{"Y":-95.79222869873047,"X":-308.470947265625,"Z":-70.84195709228516},{"Y":-95.05797576904297,"X":-303.8531188964844,"Z":-75.67123413085938},{"Y":-95.10899353027344,"X":-300.6355895996094,"Z":-81.04539489746094},{"Y":-95.0165023803711,"X":-295.3440246582031,"Z":-87.11111450195313},{"Y":-95.09793853759766,"X":-288.1673889160156,"Z":-96.05264282226563},{"Y":-94.73368072509766,"X":-282.41986083984377,"Z":-105.43706512451172},{"Y":-93.48997497558594,"X":-278.531494140625,"Z":-110.31470489501953},{"Y":-95.09870910644531,"X":-275.50848388671877,"Z":-113.48338317871094},{"Y":-95.15406799316406,"X":-271.7240295410156,"Z":-117.23706817626953},{"Y":-95.0058364868164,"X":-265.0184631347656,"Z":-126.0241928100586},{"Y":-95.93844604492188,"X":-260.0666198730469,"Z":-132.5458984375},{"Y":-95.11720275878906,"X":-251.740234375,"Z":-139.45077514648438},{"Y":-95.04246520996094,"X":-243.68594360351563,"Z":-148.72842407226563},{"Y":-95.46965026855469,"X":-234.91351318359376,"Z":-157.98513793945313},{"Y":-95.31824493408203,"X":-226.44410705566407,"Z":-166.62222290039063},{"Y":-95.38156127929688,"X":-222.26589965820313,"Z":-172.7139892578125},{"Y":-95.42133331298828,"X":-220.82565307617188,"Z":-177.69717407226563},{"Y":-97.69954681396485,"X":-221.20355224609376,"Z":-183.7405242919922},{"Y":-99.82412719726563,"X":-225.7449951171875,"Z":-191.5548553466797},{"Y":-99.14374542236328,"X":-229.0948944091797,"Z":-197.26609802246095},{"Y":-97.5513916015625,"X":-231.59165954589845,"Z":-201.3795623779297},{"Y":-95.52567291259766,"X":-235.452392578125,"Z":-205.2772216796875},{"Y":-95.14883422851563,"X":-239.47412109375,"Z":-210.82508850097657},{"Y":-95.01182556152344,"X":-242.4380340576172,"Z":-219.77882385253907},{"Y":-95.62877655029297,"X":-244.51483154296876,"Z":-225.77154541015626},{"Y":-88.48075103759766,"X":-244.37945556640626,"Z":-230.17225646972657},{"Y":-87.98904418945313,"X":-244.45021057128907,"Z":-230.2062530517578},{"Y":-84.39086151123047,"X":-246.72763061523438,"Z":-234.84194946289063},{"Y":-83.00211334228516,"X":-247.86891174316407,"Z":-240.84666442871095},{"Y":-83.06329345703125,"X":-240.7316131591797,"Z":-246.23976135253907},{"Y":-83.09381866455078,"X":-230.1736297607422,"Z":-250.56680297851563},{"Y":-83.00857543945313,"X":-222.8251953125,"Z":-253.6243896484375},{"Y":-84.29207611083985,"X":-215.521728515625,"Z":-254.6692352294922},{"Y":-86.75212860107422,"X":-208.08596801757813,"Z":-255.16384887695313},{"Y":-87.35938262939453,"X":-190.8312530517578,"Z":-258.8103942871094},{"Y":-87.35938262939453,"X":-176.76171875,"Z":-261.3516845703125},{"Y":-87.35938262939453,"X":-170.90354919433595,"Z":-261.9703063964844},{"Y":-87.36454010009766,"X":-162.23074340820313,"Z":-262.0455322265625},{"Y":-87.30305480957031,"X":-156.0056610107422,"Z":-265.3402404785156},{"Y":-87.35938262939453,"X":-146.29310607910157,"Z":-271.3807067871094},{"Y":-87.35938262939453,"X":-137.57298278808595,"Z":-277.6025085449219},{"Y":-88.37824249267578,"X":-129.09967041015626,"Z":-283.6488342285156},{"Y":-90.63358306884766,"X":-125.04290771484375,"Z":-286.5411376953125},{"Y":-91.12584686279297,"X":-120.08241271972656,"Z":-292.30157470703127},{"Y":-92.5192642211914,"X":-118.89540100097656,"Z":-302.3857116699219},{"Y":-95.46027374267578,"X":-117.47434997558594,"Z":-313.2869567871094},{"Y":-96.96993255615235,"X":-118.33184814453125,"Z":-317.43243408203127},{"Y":-100.22528839111328,"X":-120.45807647705078,"Z":-328.4774475097656},{"Y":-102.96926879882813,"X":-122.14581298828125,"Z":-336.26666259765627},{"Y":-103.05770111083985,"X":-125.22838592529297,"Z":-346.6028137207031},{"Y":-103.00000762939453,"X":-136.71902465820313,"Z":-351.5445861816406},{"Y":-103.00000762939453,"X":-136.71902465820313,"Z":-351.5445861816406},{"Y":-103.00000762939453,"X":-144.86769104003907,"Z":-352.9888916015625},{"Y":-101.13612365722656,"X":-145.85133361816407,"Z":-360.3791198730469},{"Y":-98.49126434326172,"X":-146.59666442871095,"Z":-365.6459045410156},{"Y":-100.81442260742188,"X":-147.7924041748047,"Z":-369.94775390625},{"Y":-101.10242462158203,"X":-148.36695861816407,"Z":-375.2133483886719},{"Y":-103.00000762939453,"X":-149.88954162597657,"Z":-381.9173583984375},{"Y":-103.00000762939453,"X":-145.1403045654297,"Z":-400.9230651855469},{"Y":-103.00000762939453,"X":-142.0845184326172,"Z":-408.91766357421877},{"Y":-103.00000762939453,"X":-138.65945434570313,"Z":-416.47088623046877},{"Y":-100.76055908203125,"X":-144.7631378173828,"Z":-422.018798828125},{"Y":-97.20696258544922,"X":-150.52719116210938,"Z":-425.9935607910156},{"Y":-96.76589965820313,"X":-156.16510009765626,"Z":-429.43115234375},{"Y":-94.77669525146485,"X":-163.31300354003907,"Z":-431.4628601074219},{"Y":-95.30088806152344,"X":-168.51681518554688,"Z":-434.3735046386719},{"Y":-95.80716705322266,"X":-170.49996948242188,"Z":-437.097412109375},{"Y":-83.86056518554688,"X":-173.37893676757813,"Z":-439.1968688964844},{"Y":-76.04844665527344,"X":-175.99185180664063,"Z":-442.6613464355469},{"Y":-70.46123504638672,"X":-180.02688598632813,"Z":-441.8245544433594},{"Y":-69.2658462524414,"X":-181.22891235351563,"Z":-445.7892150878906},{"Y":-68.28211212158203,"X":-183.29376220703126,"Z":-449.6356201171875},{"Y":-67.24351501464844,"X":-186.4100799560547,"Z":-458.318603515625},{"Y":-66.74244689941406,"X":-189.03970336914063,"Z":-465.4115295410156},{"Y":-64.59182739257813,"X":-191.3179168701172,"Z":-471.6329345703125},{"Y":-63.7956657409668,"X":-193.5601806640625,"Z":-477.7341613769531},{"Y":-63.00299835205078,"X":-197.02984619140626,"Z":-486.9695129394531},{"Y":-62.678314208984378,"X":-198.73402404785157,"Z":-493.0776062011719},{"Y":-62.290645599365237,"X":-199.21775817871095,"Z":-500.0246887207031},{"Y":-60.178802490234378,"X":-200.62741088867188,"Z":-504.93548583984377},{"Y":-59.32793426513672,"X":-202.8759307861328,"Z":-510.2333984375},{"Y":-59.00151443481445,"X":-205.3984832763672,"Z":-514.712890625},{"Y":-59.0000114440918,"X":-207.84445190429688,"Z":-519.203857421875},{"Y":-59.00000762939453,"X":-210.44793701171876,"Z":-524.4611206054688},{"Y":-59.64311981201172,"X":-207.5582733154297,"Z":-531.1919555664063},{"Y":-59.82799530029297,"X":-205.5968017578125,"Z":-536.6119995117188},{"Y":-60.31904602050781,"X":-200.94775390625,"Z":-540.5704345703125},{"Y":-62.139793395996097,"X":-195.75204467773438,"Z":-544.42236328125},{"Y":-62.458988189697269,"X":-190.65121459960938,"Z":-548.85986328125},{"Y":-62.813838958740237,"X":-187.56002807617188,"Z":-551.7732543945313},{"Y":-63.66682052612305,"X":-181.9439239501953,"Z":-554.0645141601563},{"Y":-63.527862548828128,"X":-179.42190551757813,"Z":-558.3579711914063},{"Y":-63.352500915527347,"X":-177.41607666015626,"Z":-563.9832153320313},{"Y":-63.41073226928711,"X":-176.241455078125,"Z":-570.5111694335938},{"Y":-64.49991607666016,"X":-175.9480438232422,"Z":-577.015869140625},{"Y":-63.06900405883789,"X":-175.98338317871095,"Z":-585.5447387695313},{"Y":-62.73409652709961,"X":-177.16867065429688,"Z":-591.5563354492188},{"Y":-63.32291793823242,"X":-178.06787109375,"Z":-597.5197143554688},{"Y":-64.02328491210938,"X":-180.26329040527345,"Z":-603.1925048828125},{"Y":-63.814388275146487,"X":-185.46737670898438,"Z":-607.4746704101563},{"Y":-63.000003814697269,"X":-190.39285278320313,"Z":-611.1945190429688},{"Y":-61.1368408203125,"X":-198.29006958007813,"Z":-616.773681640625},{"Y":-61.19588851928711,"X":-211.95291137695313,"Z":-623.9490966796875},{"Y":-61.202476501464847,"X":-206.43112182617188,"Z":-622.0658569335938},{"Y":-62.23707580566406,"X":-201.0540008544922,"Z":-620.2713623046875},{"Y":-63.02888870239258,"X":-195.5946502685547,"Z":-618.2084350585938},{"Y":-63.56769943237305,"X":-191.4556427001953,"Z":-615.5661010742188},{"Y":-63.138919830322269,"X":-186.8408966064453,"Z":-612.2530517578125},{"Y":-64.28536987304688,"X":-180.99203491210938,"Z":-606.8514404296875},{"Y":-63.7240104675293,"X":-177.5050506591797,"Z":-600.517822265625},{"Y":-63.3953742980957,"X":-175.6982421875,"Z":-593.75244140625},{"Y":-63.077919006347659,"X":-174.42970275878907,"Z":-589.0972900390625},{"Y":-63.36560821533203,"X":-174.081787109375,"Z":-583.1607666015625},{"Y":-64.39920806884766,"X":-174.2303924560547,"Z":-574.9007568359375},{"Y":-63.23647689819336,"X":-175.58212280273438,"Z":-567.0382690429688},{"Y":-63.42551803588867,"X":-179.4842987060547,"Z":-557.9282836914063},{"Y":-63.25535202026367,"X":-183.52920532226563,"Z":-552.4226684570313},{"Y":-62.81668472290039,"X":-190.70440673828126,"Z":-547.7193603515625},{"Y":-61.94496536254883,"X":-196.6112060546875,"Z":-543.4088745117188},{"Y":-60.464542388916019,"X":-201.5054473876953,"Z":-540.1172485351563},{"Y":-59.615318298339847,"X":-206.31777954101563,"Z":-535.6041870117188},{"Y":-60.316322326660159,"X":-217.06204223632813,"Z":-538.336669921875},{"Y":-59.0000114440918,"X":-226.6914825439453,"Z":-540.95947265625},{"Y":-59.572731018066409,"X":-232.6551513671875,"Z":-544.1929931640625},{"Y":-58.89931869506836,"X":-243.751220703125,"Z":-548.5256958007813},{"Y":-57.34613037109375,"X":-250.2448272705078,"Z":-550.66552734375},{"Y":-56.45731735229492,"X":-255.5286102294922,"Z":-553.22021484375},{"Y":-56.15519714355469,"X":-261.39471435546877,"Z":-555.45458984375},{"Y":-56.505672454833987,"X":-269.15496826171877,"Z":-558.078125},{"Y":-57.65422058105469,"X":-275.9513854980469,"Z":-561.122802734375},{"Y":-56.96424865722656,"X":-284.8126220703125,"Z":-564.08642578125},{"Y":-56.983333587646487,"X":-284.9429626464844,"Z":-564.1267700195313},{"Y":-56.82405471801758,"X":-292.3406066894531,"Z":-565.6107177734375},{"Y":-55.00723648071289,"X":-302.4510192871094,"Z":-566.904541015625},{"Y":-54.15977478027344,"X":-307.3827819824219,"Z":-567.1519775390625},{"Y":-51.07828140258789,"X":-312.39459228515627,"Z":-568.4590454101563},{"Y":-49.016868591308597,"X":-315.4921569824219,"Z":-567.5194091796875},{"Y":-48.28683090209961,"X":-322.824951171875,"Z":-567.490234375},{"Y":-47.344970703125,"X":-331.6112060546875,"Z":-566.8800048828125},{"Y":-47.12678146362305,"X":-341.30462646484377,"Z":-566.5213012695313},{"Y":-47.0000114440918,"X":-349.1828308105469,"Z":-565.2504272460938},{"Y":-46.447654724121097,"X":-359.44329833984377,"Z":-563.3630981445313},{"Y":-43.81968307495117,"X":-374.18994140625,"Z":-559.7761840820313},{"Y":-43.89230728149414,"X":-369.431640625,"Z":-560.6578369140625},{"Y":-45.12745666503906,"X":-363.57623291015627,"Z":-563.3161010742188},{"Y":-46.59803771972656,"X":-359.2049560546875,"Z":-563.85205078125},{"Y":-47.0000114440918,"X":-352.8284912109375,"Z":-564.6251831054688},{"Y":-47.000003814697269,"X":-347.64923095703127,"Z":-565.5892944335938},{"Y":-47.13393020629883,"X":-341.6055603027344,"Z":-566.1532592773438},{"Y":-47.26200485229492,"X":-335.0334167480469,"Z":-568.0886840820313},{"Y":-47.44114685058594,"X":-329.3523254394531,"Z":-567.7783203125},{"Y":-48.1494255065918,"X":-324.7779235839844,"Z":-568.2584228515625},{"Y":-48.508460998535159,"X":-319.99627685546877,"Z":-568.1093139648438},{"Y":-49.13642120361328,"X":-315.4711608886719,"Z":-568.2352905273438},{"Y":-51.85264205932617,"X":-311.59716796875,"Z":-568.5387573242188},{"Y":-54.87385177612305,"X":-307.6493835449219,"Z":-568.1574096679688},{"Y":-55.3621940612793,"X":-302.8427734375,"Z":-568.4052734375},{"Y":-57.02554702758789,"X":-290.07720947265627,"Z":-565.860107421875},{"Y":-57.321537017822269,"X":-278.542236328125,"Z":-562.580078125},{"Y":-57.445152282714847,"X":-270.827392578125,"Z":-559.4599609375},{"Y":-56.286224365234378,"X":-264.66168212890627,"Z":-557.3670654296875},{"Y":-56.26775360107422,"X":-257.70947265625,"Z":-553.825439453125},{"Y":-57.17439651489258,"X":-251.8545379638672,"Z":-551.1435546875},{"Y":-57.640350341796878,"X":-247.33480834960938,"Z":-550.1499633789063},{"Y":-59.14896011352539,"X":-241.229736328125,"Z":-547.7415771484375},{"Y":-59.242088317871097,"X":-236.28579711914063,"Z":-545.7935180664063},{"Y":-59.37650680541992,"X":-230.28863525390626,"Z":-543.4661865234375},{"Y":-59.000003814697269,"X":-226.30740356445313,"Z":-540.4559326171875},{"Y":-59.612422943115237,"X":-220.17324829101563,"Z":-535.5726928710938},{"Y":-59.04669189453125,"X":-214.8605194091797,"Z":-531.0310668945313},{"Y":-59.01347732543945,"X":-211.8662872314453,"Z":-526.9235229492188},{"Y":-59.000003814697269,"X":-209.5055694580078,"Z":-522.4961547851563},{"Y":-59.000003814697269,"X":-207.05174255371095,"Z":-517.881103515625},{"Y":-59.264854431152347,"X":-203.041259765625,"Z":-510.9551696777344},{"Y":-60.10297775268555,"X":-200.97036743164063,"Z":-505.1920166015625},{"Y":-62.75037384033203,"X":-198.9687957763672,"Z":-499.4559020996094},{"Y":-63.24905776977539,"X":-193.30291748046876,"Z":-486.3470458984375},{"Y":-63.38013458251953,"X":-191.65655517578126,"Z":-481.4469909667969},{"Y":-64.10955810546875,"X":-189.9131317138672,"Z":-476.0428771972656},{"Y":-65.89789581298828,"X":-187.49147033691407,"Z":-469.1298828125},{"Y":-67.04338836669922,"X":-184.78468322753907,"Z":-465.32958984375},{"Y":-67.26687622070313,"X":-182.0261993408203,"Z":-460.62249755859377},{"Y":-67.74453735351563,"X":-180.1875762939453,"Z":-456.1526794433594},{"Y":-69.74339294433594,"X":-177.01202392578126,"Z":-449.2494812011719},{"Y":-79.74627685546875,"X":-173.9616241455078,"Z":-447.4073791503906},{"Y":-87.43121337890625,"X":-173.59518432617188,"Z":-447.42218017578127},{"Y":-97.65748596191406,"X":-171.7164764404297,"Z":-448.8951416015625},{"Y":-98.09590148925781,"X":-164.6468963623047,"Z":-453.08929443359377},{"Y":-101.65953826904297,"X":-158.0391387939453,"Z":-458.8531188964844},{"Y":-102.46603393554688,"X":-155.5732879638672,"Z":-465.1424255371094},{"Y":-100.82835388183594,"X":-154.70046997070313,"Z":-470.3881530761719},{"Y":-100.31939697265625,"X":-153.71163940429688,"Z":-477.1285705566406},{"Y":-99.27128601074219,"X":-154.0566864013672,"Z":-483.8548583984375},{"Y":-99.62100219726563,"X":-156.71546936035157,"Z":-491.1533203125},{"Y":-98.96883392333985,"X":-160.36277770996095,"Z":-495.5070495605469},{"Y":-99.79095458984375,"X":-163.8101806640625,"Z":-500.4339599609375},{"Y":-98.93743133544922,"X":-167.73947143554688,"Z":-502.4769287109375},{"Y":-100.14273071289063,"X":-171.01258850097657,"Z":-504.48211669921877},{"Y":-101.61492919921875,"X":-174.79689025878907,"Z":-504.9563903808594},{"Y":-103.00000762939453,"X":-180.6370849609375,"Z":-505.9040832519531},{"Y":-103.01583862304688,"X":-184.98912048339845,"Z":-505.07012939453127},{"Y":-103.61245727539063,"X":-189.76242065429688,"Z":-502.40545654296877},{"Y":-103.47999572753906,"X":-192.02926635742188,"Z":-498.1982421875},{"Y":-103.30896759033203,"X":-194.09228515625,"Z":-493.8262634277344},{"Y":-103.12577819824219,"X":-194.24163818359376,"Z":-488.2802429199219},{"Y":-103.00000762939453,"X":-193.27169799804688,"Z":-482.6933898925781},{"Y":-103.1325912475586,"X":-193.02549743652345,"Z":-476.7752685546875},{"Y":-103.92680358886719,"X":-188.04367065429688,"Z":-455.97003173828127},{"Y":-103.53252410888672,"X":-189.24998474121095,"Z":-463.944580078125},{"Y":-103.6652603149414,"X":-189.23426818847657,"Z":-461.74627685546877},{"Y":-103.40560150146485,"X":-190.54135131835938,"Z":-468.6949462890625},{"Y":-103.30650329589844,"X":-190.59259033203126,"Z":-473.95819091796877},{"Y":-103.11180114746094,"X":-191.74282836914063,"Z":-478.0567932128906},{"Y":-103.00000762939453,"X":-192.79946899414063,"Z":-484.1268310546875},{"Y":-103.21089935302735,"X":-194.37750244140626,"Z":-490.1123962402344},{"Y":-103.28922271728516,"X":-194.64759826660157,"Z":-495.2102355957031},{"Y":-103.33197021484375,"X":-188.67269897460938,"Z":-504.1286315917969},{"Y":-103.0000228881836,"X":-184.55014038085938,"Z":-506.5970153808594},{"Y":-103.00000762939453,"X":-180.38400268554688,"Z":-506.58123779296877},{"Y":-102.87371063232422,"X":-176.34750366210938,"Z":-506.178466796875},{"Y":-100.74671936035156,"X":-172.45008850097657,"Z":-505.1723327636719},{"Y":-99.36065673828125,"X":-169.1734161376953,"Z":-504.49017333984377},{"Y":-99.25971221923828,"X":-165.71566772460938,"Z":-502.1513366699219},{"Y":-100.14949798583985,"X":-162.4173583984375,"Z":-500.062255859375},{"Y":-100.26713562011719,"X":-160.0631561279297,"Z":-498.8113098144531},{"Y":-99.93343353271485,"X":-158.33229064941407,"Z":-498.0462341308594},{"Y":-102.15921783447266,"X":-156.21298217773438,"Z":-496.6521301269531},{"Y":-102.9714126586914,"X":-153.56703186035157,"Z":-494.7513427734375},{"Y":-102.12173461914063,"X":-149.4110565185547,"Z":-491.4580993652344},{"Y":-101.30577087402344,"X":-145.6412811279297,"Z":-490.9678649902344},{"Y":-97.20231628417969,"X":-143.7764892578125,"Z":-489.89031982421877},{"Y":-95.60545349121094,"X":-139.08172607421876,"Z":-488.4168701171875},{"Y":-102.31900024414063,"X":-135.48126220703126,"Z":-489.5281066894531},{"Y":-102.979248046875,"X":-133.2329559326172,"Z":-489.2873229980469},{"Y":-103.00001525878906,"X":-127.97173309326172,"Z":-487.975341796875},{"Y":-103.00001525878906,"X":-79.37040710449219,"Z":-469.1907043457031},{"Y":-102.1550521850586,"X":-66.7137680053711,"Z":-464.466064453125},{"Y":-103.00753784179688,"X":-33.53963851928711,"Z":-443.9488220214844},{"Y":-103.00001525878906,"X":-7.2169084548950199,"Z":-423.7174072265625},{"Y":-103.00001525878906,"X":5.645600318908691,"Z":-414.6301574707031},{"Y":-102.96369934082031,"X":10.715620994567871,"Z":-412.7769470214844},{"Y":-101.1667709350586,"X":14.230298042297364,"Z":-410.8058776855469},{"Y":-99.53105163574219,"X":17.176307678222658,"Z":-406.2011413574219},{"Y":-99.00833129882813,"X":19.262603759765626,"Z":-399.86529541015627},{"Y":-99.00000762939453,"X":21.457107543945314,"Z":-392.7776794433594},{"Y":-99.00000762939453,"X":23.818410873413087,"Z":-385.7351379394531},{"Y":-99.764404296875,"X":27.23123550415039,"Z":-380.1177062988281},{"Y":-99.1318130493164,"X":30.974790573120118,"Z":-376.6280517578125},{"Y":-99.14682006835938,"X":34.79861068725586,"Z":-372.4682312011719},{"Y":-99.02922821044922,"X":39.21270751953125,"Z":-369.3519287109375},{"Y":-99.00000762939453,"X":44.148197174072269,"Z":-366.4522399902344},{"Y":-99.00000762939453,"X":46.56171798706055,"Z":-365.0018005371094},{"Y":-99.01284790039063,"X":39.77490234375,"Z":-369.3465270996094},{"Y":-99.10360717773438,"X":34.365623474121097,"Z":-373.3647155761719},{"Y":-99.22843170166016,"X":30.29146957397461,"Z":-377.0910949707031},{"Y":-99.40595245361328,"X":25.668378829956056,"Z":-382.42327880859377},{"Y":-98.95723724365235,"X":22.92344856262207,"Z":-387.7895202636719},{"Y":-98.97080993652344,"X":20.7519474029541,"Z":-391.99932861328127},{"Y":-99.00000762939453,"X":20.534090042114259,"Z":-394.623779296875},{"Y":-99.00000762939453,"X":19.596723556518556,"Z":-398.92401123046877},{"Y":-99.1170654296875,"X":18.4244384765625,"Z":-402.33209228515627},{"Y":-99.90562438964844,"X":16.596240997314454,"Z":-407.9329833984375},{"Y":-101.84940338134766,"X":13.024261474609375,"Z":-411.8129577636719},{"Y":-103.0000228881836,"X":9.794367790222168,"Z":-414.4010925292969},{"Y":-103.00000762939453,"X":5.163547039031982,"Z":-415.0447692871094},{"Y":-103.00000762939453,"X":-0.8169200420379639,"Z":-413.1485595703125},{"Y":-103.00000762939453,"X":-8.876054763793946,"Z":-409.63836669921877},{"Y":-103.00000762939453,"X":-18.952497482299806,"Z":-406.2098388671875},{"Y":-103.00000762939453,"X":-28.91268539428711,"Z":-402.0211181640625},{"Y":-103.00000762939453,"X":-37.31935501098633,"Z":-398.632080078125},{"Y":-103.00000762939453,"X":-41.474361419677737,"Z":-397.76019287109377},{"Y":-103.76359558105469,"X":-45.41937255859375,"Z":-393.21075439453127},{"Y":-105.99127960205078,"X":-48.10205078125,"Z":-389.1835021972656},{"Y":-107.13615417480469,"X":-49.983612060546878,"Z":-384.22442626953127},{"Y":-107.13345336914063,"X":-49.83464431762695,"Z":-376.1189880371094},{"Y":-99.47006225585938,"X":-48.00266647338867,"Z":-374.5227966308594},{"Y":-93.28038024902344,"X":-44.70210647583008,"Z":-370.5268859863281},{"Y":-91.69461822509766,"X":-41.874755859375,"Z":-368.1977844238281},{"Y":-92.01753997802735,"X":-36.18212127685547,"Z":-364.0909423828125},{"Y":-92.3974380493164,"X":-30.00266456604004,"Z":-360.2303161621094},{"Y":-92.50655364990235,"X":-17.300344467163087,"Z":-351.6179504394531},{"Y":-92.63719177246094,"X":-4.8089094161987309,"Z":-344.04229736328127},{"Y":-91.33001708984375,"X":5.89284610748291,"Z":-337.8616027832031},{"Y":-91.00006103515625,"X":16.35256004333496,"Z":-332.51617431640627},{"Y":-88.78372192382813,"X":19.49407958984375,"Z":-331.183349609375},{"Y":-87.59981536865235,"X":23.87333869934082,"Z":-329.375732421875},{"Y":-85.31491088867188,"X":30.50506591796875,"Z":-326.5985107421875},{"Y":-85.1034927368164,"X":35.61722946166992,"Z":-324.2135009765625},{"Y":-85.4720230102539,"X":42.46598815917969,"Z":-322.36639404296877},{"Y":-85.97750854492188,"X":50.726444244384769,"Z":-322.1221618652344},{"Y":-85.48037719726563,"X":57.31975555419922,"Z":-322.4278564453125},{"Y":-86.45069122314453,"X":64.56475067138672,"Z":-322.33660888671877},{"Y":-87.36480712890625,"X":72.86872863769531,"Z":-322.92657470703127},{"Y":-88.13557434082031,"X":82.82614135742188,"Z":-323.2299499511719},{"Y":-88.36054229736328,"X":90.1399917602539,"Z":-323.8626403808594},{"Y":-88.57638549804688,"X":98.1268539428711,"Z":-325.11273193359377},{"Y":-88.92693328857422,"X":109.1222152709961,"Z":-326.0740966796875},{"Y":-91.00001525878906,"X":118.00956726074219,"Z":-327.6623229980469},{"Y":-91.0508804321289,"X":127.82832336425781,"Z":-329.6975402832031},{"Y":-91.294189453125,"X":136.45968627929688,"Z":-332.22021484375},{"Y":-91.26464080810547,"X":145.07260131835938,"Z":-336.8603515625},{"Y":-91.13737487792969,"X":158.0054168701172,"Z":-340.6458435058594},{"Y":-91.16543579101563,"X":158.15371704101563,"Z":-340.6817321777344},{"Y":-91.69536590576172,"X":165.78897094726563,"Z":-343.2317199707031},{"Y":-91.81916809082031,"X":173.3730926513672,"Z":-346.3667297363281},{"Y":-91.093505859375,"X":181.56753540039063,"Z":-349.87030029296877},{"Y":-88.51024627685547,"X":189.40992736816407,"Z":-354.0649108886719},{"Y":-87.0916976928711,"X":199.33592224121095,"Z":-359.0181579589844},{"Y":-85.81298065185547,"X":208.46507263183595,"Z":-364.5061950683594},{"Y":-83.01431274414063,"X":216.1343536376953,"Z":-369.0608825683594},{"Y":-81.1216049194336,"X":224.5341033935547,"Z":-373.32330322265627},{"Y":-75.70710754394531,"X":236.02658081054688,"Z":-381.904541015625},{"Y":-75.31632995605469,"X":242.0084228515625,"Z":-385.8116455078125},{"Y":-71.89549255371094,"X":249.60986328125,"Z":-391.6736145019531},{"Y":-71.40152740478516,"X":258.43353271484377,"Z":-395.08856201171877},{"Y":-71.42951965332031,"X":267.34393310546877,"Z":-398.74261474609377},{"Y":-71.56745147705078,"X":276.4364013671875,"Z":-402.27667236328127},{"Y":-71.31961822509766,"X":284.67913818359377,"Z":-406.3052062988281},{"Y":-71.47847747802735,"X":289.25799560546877,"Z":-408.5839538574219},{"Y":-71.45027923583985,"X":297.39898681640627,"Z":-415.04876708984377},{"Y":-72.05133819580078,"X":303.7857360839844,"Z":-420.0483093261719},{"Y":-73.68235778808594,"X":313.4743957519531,"Z":-423.6623840332031},{"Y":-71.80896759033203,"X":321.6365966796875,"Z":-426.8226623535156},{"Y":-71.10367584228516,"X":328.8031005859375,"Z":-431.0181884765625},{"Y":-71.00730895996094,"X":335.3143615722656,"Z":-438.2747497558594},{"Y":-71.01094818115235,"X":341.1527404785156,"Z":-447.8479309082031},{"Y":-71.6242904663086,"X":346.75933837890627,"Z":-456.5466613769531},{"Y":-71.29307556152344,"X":352.5870056152344,"Z":-466.1902770996094},{"Y":-70.86540222167969,"X":358.7362976074219,"Z":-475.7027893066406},{"Y":-68.39224243164063,"X":364.991943359375,"Z":-486.0800476074219},{"Y":-68.05561828613281,"X":368.867919921875,"Z":-492.71490478515627},{"Y":-66.1182632446289,"X":375.6039123535156,"Z":-498.4945373535156},{"Y":-65.57193756103516,"X":381.8541564941406,"Z":-507.0439147949219},{"Y":-64.65721893310547,"X":391.3791198730469,"Z":-516.1453857421875},{"Y":-63.941402435302737,"X":397.1769714355469,"Z":-525.44482421875},{"Y":-64.53570556640625,"X":400.4801330566406,"Z":-534.0413208007813},{"Y":-63.148372650146487,"X":407.1367492675781,"Z":-542.2803955078125},{"Y":-63.14043045043945,"X":415.5257873535156,"Z":-553.5704345703125},{"Y":-61.69130325317383,"X":419.8596496582031,"Z":-560.0626831054688},{"Y":-59.40192794799805,"X":425.5100402832031,"Z":-566.5234985351563},{"Y":-58.978965759277347,"X":432.128662109375,"Z":-572.3358764648438},{"Y":-59.00000762939453,"X":436.693115234375,"Z":-577.79052734375},{"Y":-56.82745361328125,"X":441.7837219238281,"Z":-581.4207153320313},{"Y":-55.06602096557617,"X":445.6024169921875,"Z":-587.9994506835938},{"Y":-54.60768127441406,"X":450.03228759765627,"Z":-595.1284790039063},{"Y":-53.208534240722659,"X":451.0924377441406,"Z":-603.5775146484375},{"Y":-53.11309814453125,"X":450.9548645019531,"Z":-609.203125},{"Y":-53.925682067871097,"X":451.69329833984377,"Z":-616.9981079101563},{"Y":-52.25180435180664,"X":452.1412353515625,"Z":-629.2201538085938},{"Y":-51.75102615356445,"X":452.6184997558594,"Z":-635.9013671875},{"Y":-52.380496978759769,"X":452.373779296875,"Z":-643.3695678710938},{"Y":-51.870059967041019,"X":452.90521240234377,"Z":-649.3681640625},{"Y":-51.356163024902347,"X":453.2222595214844,"Z":-656.0545654296875},{"Y":-51.7972412109375,"X":454.7962646484375,"Z":-662.0711669921875},{"Y":-52.7027702331543,"X":460.5776672363281,"Z":-667.1488647460938},{"Y":-53.161376953125,"X":466.97552490234377,"Z":-671.19287109375},{"Y":-52.10496520996094,"X":474.5755310058594,"Z":-676.9606323242188},{"Y":-51.94087219238281,"X":478.26922607421877,"Z":-682.6398315429688},{"Y":-51.41162109375,"X":481.71319580078127,"Z":-689.6708374023438},{"Y":-50.98004150390625,"X":484.9610595703125,"Z":-697.4990844726563},{"Y":-47.856300354003909,"X":487.9187316894531,"Z":-704.0797119140625},{"Y":-45.52083206176758,"X":492.315185546875,"Z":-709.850830078125},{"Y":-43.49981689453125,"X":495.3564758300781,"Z":-715.9573974609375},{"Y":-41.287471771240237,"X":501.4067077636719,"Z":-722.189697265625},{"Y":-39.37484359741211,"X":505.83203125,"Z":-723.9456787109375},{"Y":-36.90139389038086,"X":513.1641235351563,"Z":-724.67822265625},{"Y":-35.95829391479492,"X":518.325439453125,"Z":-723.7459716796875},{"Y":-35.15633010864258,"X":530.84326171875,"Z":-720.4002075195313},{"Y":-34.11772537231445,"X":540.21044921875,"Z":-721.3136596679688},{"Y":-35.0068359375,"X":547.15625,"Z":-723.103271484375},{"Y":-35.52475357055664,"X":552.67431640625,"Z":-730.8314819335938},{"Y":-35.41643142700195,"X":557.5183715820313,"Z":-740.511474609375},{"Y":-35.25937271118164,"X":558.8951416015625,"Z":-747.4848022460938},{"Y":-35.119415283203128,"X":558.0640258789063,"Z":-753.0870971679688},{"Y":-35.27024841308594,"X":554.7924194335938,"Z":-756.9083251953125},{"Y":-35.70045852661133,"X":550.3020629882813,"Z":-758.5770263671875},{"Y":-35.270591735839847,"X":541.8079223632813,"Z":-761.1456298828125},{"Y":-35.24140930175781,"X":540.473876953125,"Z":-761.3522338867188},{"Y":-33.37395477294922,"X":529.3583984375,"Z":-763.2202758789063},{"Y":-31.595523834228517,"X":524.3916625976563,"Z":-764.1766967773438},{"Y":-31.526243209838868,"X":520.3895263671875,"Z":-764.2965698242188},{"Y":-33.906646728515628,"X":514.0916748046875,"Z":-765.1187133789063},{"Y":-33.32465362548828,"X":510.3059997558594,"Z":-765.6875},{"Y":-34.70513153076172,"X":504.02935791015627,"Z":-767.7280883789063},{"Y":-33.90547180175781,"X":494.9452209472656,"Z":-768.2471923828125},{"Y":-32.00535583496094,"X":484.8426513671875,"Z":-769.9569702148438},{"Y":-31.999229431152345,"X":478.531494140625,"Z":-770.6214599609375},{"Y":-30.743398666381837,"X":472.7296142578125,"Z":-773.745361328125},{"Y":-25.965547561645509,"X":465.7404479980469,"Z":-777.3642578125},{"Y":-19.86446189880371,"X":461.5812683105469,"Z":-779.3087768554688},{"Y":-17.81456756591797,"X":457.8529357910156,"Z":-779.94970703125},{"Y":-12.650157928466797,"X":455.0748596191406,"Z":-781.0913696289063},{"Y":-6.708874225616455,"X":456.9185791015625,"Z":-783.9871826171875},{"Y":-3.000000238418579,"X":462.2825622558594,"Z":-794.510498046875},{"Y":-3.000000238418579,"X":469.63446044921877,"Z":-804.6605834960938},{"Y":-3.000000238418579,"X":478.5478515625,"Z":-817.6648559570313},{"Y":-4.501697063446045,"X":483.7603454589844,"Z":-826.3591918945313},{"Y":-8.203429222106934,"X":488.087646484375,"Z":-833.9395751953125},{"Y":-11.352645874023438,"X":502.91162109375,"Z":-858.2713012695313},{"Y":-11.242172241210938,"X":511.4459228515625,"Z":-870.2442016601563},{"Y":-8.193377494812012,"X":515.7507934570313,"Z":-877.2730712890625},{"Y":-9.70083236694336,"X":517.7582397460938,"Z":-880.806884765625},{"Y":-11.00100040435791,"X":523.3612670898438,"Z":-887.964599609375},{"Y":-10.97470474243164,"X":533.0726928710938,"Z":-904.9275512695313},{"Y":-9.464913368225098,"X":536.4889526367188,"Z":-910.5225830078125},{"Y":-11.018770217895508,"X":547.3228759765625,"Z":-927.0430297851563},{"Y":-11.150381088256836,"X":557.2415771484375,"Z":-942.1712646484375},{"Y":-11.896444320678711,"X":566.6336669921875,"Z":-955.8359375},{"Y":-11.027509689331055,"X":576.9169311523438,"Z":-972.0747680664063},{"Y":-11.325169563293457,"X":586.1551513671875,"Z":-986.0789184570313},{"Y":-11.077478408813477,"X":596.9349365234375,"Z":-1002.3939819335938},{"Y":-11.372899055480957,"X":605.9640502929688,"Z":-1015.9476928710938},{"Y":-11.158443450927735,"X":608.3058471679688,"Z":-1019.4918212890625},{"Y":-11.720073699951172,"X":613.87744140625,"Z":-1027.2177734375},{"Y":-11.001337051391602,"X":624.8228759765625,"Z":-1043.1484375},{"Y":-11.290741920471192,"X":634.1161499023438,"Z":-1056.8089599609376},{"Y":-11.250258445739746,"X":645.2544555664063,"Z":-1073.178466796875},{"Y":-11.229779243469239,"X":654.7074584960938,"Z":-1087.103271484375},{"Y":-11.337828636169434,"X":665.385986328125,"Z":-1102.854248046875},{"Y":-11.233678817749024,"X":676.199951171875,"Z":-1118.9642333984376},{"Y":-11.535783767700196,"X":685.3723754882813,"Z":-1132.1505126953126},{"Y":-11.083427429199219,"X":696.0269775390625,"Z":-1148.610107421875},{"Y":-11.160162925720215,"X":705.4916381835938,"Z":-1161.7620849609376},{"Y":-11.374567031860352,"X":717.2235107421875,"Z":-1177.548095703125},{"Y":-11.0975980758667,"X":727.350830078125,"Z":-1191.09228515625},{"Y":-11.011122703552246,"X":739.4559326171875,"Z":-1206.44287109375},{"Y":-11.56782341003418,"X":746.195068359375,"Z":-1214.8912353515626},{"Y":-11.495028495788575,"X":756.7872314453125,"Z":-1227.767333984375},{"Y":-11.10191535949707,"X":769.6500244140625,"Z":-1242.9005126953126},{"Y":-10.975688934326172,"X":780.580078125,"Z":-1255.6376953125},{"Y":-6.98110818862915,"X":794.5745239257813,"Z":-1269.6697998046876},{"Y":-7.000000476837158,"X":807.4129638671875,"Z":-1281.92529296875},{"Y":-7.003298759460449,"X":821.1651000976563,"Z":-1296.4827880859376},{"Y":-7.000000476837158,"X":835.0215454101563,"Z":-1310.464599609375},{"Y":-6.6458611488342289,"X":846.490478515625,"Z":-1322.7518310546876},{"Y":-5.35677433013916,"X":854.3775024414063,"Z":-1331.918212890625},{"Y":-3.686399221420288,"X":861.0867919921875,"Z":-1339.641357421875},{"Y":-3.000000238418579,"X":871.8590087890625,"Z":-1352.1998291015626},{"Y":-3.000000238418579,"X":885.2681884765625,"Z":-1366.4971923828126},{"Y":-3.000000238418579,"X":896.2650146484375,"Z":-1378.3973388671876},{"Y":-3.000000238418579,"X":905.998779296875,"Z":-1391.692626953125},{"Y":-3.000000238418579,"X":906.9058227539063,"Z":-1400.519287109375},{"Y":-1.2119704484939576,"X":910.1027221679688,"Z":-1416.7523193359376},{"Y":-2.2381768226623537,"X":919.7926025390625,"Z":-1432.140869140625},{"Y":-2.659698247909546,"X":928.902587890625,"Z":-1432.854248046875},{"Y":-2.7976460456848146,"X":947.8154296875,"Z":-1432.206787109375},{"Y":-2.649895429611206,"X":952.4456176757813,"Z":-1430.4639892578126},{"Y":-2.3820414543151857,"X":958.253173828125,"Z":-1424.1778564453126},{"Y":-2.85900616645813,"X":969.6964721679688,"Z":-1409.275146484375},{"Y":-3.000000238418579,"X":961.9251708984375,"Z":-1394.689453125},{"Y":-3.000000238418579,"X":958.8926391601563,"Z":-1380.3270263671876},{"Y":-3.000000238418579,"X":952.2139892578125,"Z":-1362.2230224609376},{"Y":-3.000000238418579,"X":945.599609375,"Z":-1344.6978759765626},{"Y":-3.000000238418579,"X":940.194091796875,"Z":-1330.591796875},{"Y":-4.755360126495361,"X":935.23681640625,"Z":-1316.885498046875},{"Y":-5.0298051834106449,"X":933.7337646484375,"Z":-1313.951904296875},{"Y":-6.547778129577637,"X":928.675537109375,"Z":-1299.78125},{"Y":-7.000876426696777,"X":921.6572265625,"Z":-1281.9378662109376},{"Y":-7.01521635055542,"X":915.368896484375,"Z":-1267.5189208984376},{"Y":-7.000477313995361,"X":907.8150024414063,"Z":-1250.269287109375},{"Y":-7.0953874588012699,"X":901.4647827148438,"Z":-1235.4512939453126},{"Y":-10.693129539489746,"X":894.6290283203125,"Z":-1218.532470703125},{"Y":-11.965152740478516,"X":888.7401733398438,"Z":-1202.764892578125},{"Y":-11.029088020324707,"X":882.8477783203125,"Z":-1185.1131591796876},{"Y":-11.829781532287598,"X":876.3084106445313,"Z":-1167.5145263671876},{"Y":-11.574332237243653,"X":870.866455078125,"Z":-1149.29052734375},{"Y":-11.666831016540528,"X":864.5748291015625,"Z":-1131.5377197265626},{"Y":-11.385823249816895,"X":858.6751708984375,"Z":-1113.6240234375},{"Y":-11.858357429504395,"X":853.1700439453125,"Z":-1095.6153564453126},{"Y":-11.52717399597168,"X":848.6248779296875,"Z":-1077.2791748046876},{"Y":-10.985555648803711,"X":844.6028442382813,"Z":-1058.776611328125},{"Y":-11.37242317199707,"X":841.0623779296875,"Z":-1039.828369140625},{"Y":-10.998750686645508,"X":837.857666015625,"Z":-1021.2538452148438},{"Y":-11.163287162780762,"X":833.6917114257813,"Z":-1002.8372802734375},{"Y":-11.033207893371582,"X":830.2470092773438,"Z":-984.1293334960938},{"Y":-11.035409927368164,"X":827.65869140625,"Z":-965.3280639648438},{"Y":-11.098771095275879,"X":824.180419921875,"Z":-946.6382446289063},{"Y":-11.082868576049805,"X":820.6552734375,"Z":-928.0114135742188},{"Y":-11.721946716308594,"X":817.3250122070313,"Z":-909.3287353515625},{"Y":-11.086326599121094,"X":813.9952392578125,"Z":-890.771484375},{"Y":-12.051880836486817,"X":810.8373413085938,"Z":-872.3380737304688},{"Y":-11.425790786743164,"X":806.7002563476563,"Z":-853.8916625976563},{"Y":-11.401237487792969,"X":799.5048828125,"Z":-836.3961791992188},{"Y":-11.041778564453125,"X":791.6893310546875,"Z":-818.9173583984375},{"Y":-11.559636116027832,"X":784.379150390625,"Z":-801.506591796875},{"Y":-8.16512393951416,"X":777.2324829101563,"Z":-784.2350463867188},{"Y":-6.104599952697754,"X":768.7140502929688,"Z":-767.3301391601563},{"Y":-2.999323606491089,"X":759.7495727539063,"Z":-750.8543090820313},{"Y":-3.0000016689300539,"X":750.3023071289063,"Z":-734.3012084960938},{"Y":-3.000000238418579,"X":741.6355590820313,"Z":-717.669921875},{"Y":-3.000000238418579,"X":732.68603515625,"Z":-700.9285278320313},{"Y":-3.000000238418579,"X":721.61328125,"Z":-685.4459838867188},{"Y":-3.0192923545837404,"X":709.812255859375,"Z":-670.7706298828125},{"Y":-3.077252149581909,"X":699.0205078125,"Z":-655.3389282226563},{"Y":-3.0000007152557375,"X":687.3123168945313,"Z":-640.474365234375},{"Y":-3.0000007152557375,"X":676.284912109375,"Z":-625.0216674804688},{"Y":-3.000000238418579,"X":666.2186279296875,"Z":-609.4817504882813},{"Y":-7.062930583953857,"X":656.98779296875,"Z":-593.6758422851563},{"Y":-10.501157760620118,"X":647.9185180664063,"Z":-577.907958984375},{"Y":-7.005224227905273,"X":639.069091796875,"Z":-562.1492309570313},{"Y":-5.561940670013428,"X":629.7415771484375,"Z":-545.92822265625},{"Y":-3.766352891921997,"X":623.7985229492188,"Z":-543.0624389648438},{"Y":-0.4673363268375397,"X":621.9937744140625,"Z":-537.9271850585938},{"Y":-0.35167768597602847,"X":621.740234375,"Z":-537.330078125},{"Y":5.057130336761475,"X":619.9124145507813,"Z":-532.19287109375},{"Y":7.829787731170654,"X":619.7307739257813,"Z":-527.3246459960938},{"Y":9.092573165893555,"X":619.7583618164063,"Z":-523.2546997070313},{"Y":12.150442123413086,"X":622.040283203125,"Z":-517.8245849609375},{"Y":14.891884803771973,"X":622.7608642578125,"Z":-512.5382080078125},{"Y":19.074649810791017,"X":623.3928833007813,"Z":-506.9125671386719},{"Y":21.744691848754884,"X":623.4166259765625,"Z":-500.30145263671877},{"Y":24.510648727416993,"X":623.9564819335938,"Z":-494.74554443359377},{"Y":27.20901870727539,"X":624.2123413085938,"Z":-489.7172546386719},{"Y":30.938596725463868,"X":625.2235717773438,"Z":-481.8025817871094},{"Y":33.46348190307617,"X":625.2006225585938,"Z":-473.52020263671877},{"Y":37.338661193847659,"X":625.090087890625,"Z":-462.8758239746094},{"Y":39.754634857177737,"X":625.243896484375,"Z":-454.42193603515627},{"Y":42.682464599609378,"X":624.1384887695313,"Z":-444.88360595703127},{"Y":48.505184173583987,"X":624.8445434570313,"Z":-435.7370300292969},{"Y":52.046512603759769,"X":633.6165771484375,"Z":-426.6548767089844},{"Y":56.14674377441406,"X":642.7672729492188,"Z":-418.947265625},{"Y":61.56560516357422,"X":647.9710083007813,"Z":-415.71063232421877},{"Y":66.90442657470703,"X":652.402099609375,"Z":-413.6093444824219},{"Y":68.83395385742188,"X":655.3088989257813,"Z":-414.68035888671877},{"Y":74.64297485351563,"X":658.4923706054688,"Z":-412.1120910644531},{"Y":79.21280670166016,"X":662.7669067382813,"Z":-407.84881591796877},{"Y":82.8696517944336,"X":667.7186889648438,"Z":-402.9017028808594},{"Y":81.72157287597656,"X":670.0193481445313,"Z":-396.92236328125},{"Y":79.73120880126953,"X":672.8555297851563,"Z":-389.2047119140625},{"Y":75.80992126464844,"X":666.6765747070313,"Z":-383.57257080078127},{"Y":74.29961395263672,"X":662.3096313476563,"Z":-380.9429016113281},{"Y":66.30169677734375,"X":658.3692626953125,"Z":-377.58404541015627},{"Y":54.23489761352539,"X":652.8509521484375,"Z":-375.7156066894531},{"Y":52.981605529785159,"X":646.2808837890625,"Z":-372.0798034667969},{"Y":52.543670654296878,"X":638.552734375,"Z":-368.2397155761719},{"Y":51.33763122558594,"X":634.8888549804688,"Z":-367.001953125},{"Y":46.14652633666992,"X":627.9397583007813,"Z":-365.9909973144531},{"Y":40.777610778808597,"X":621.4282836914063,"Z":-364.93994140625},{"Y":35.738006591796878,"X":615.6478271484375,"Z":-364.5306701660156},{"Y":34.590538024902347,"X":605.122802734375,"Z":-368.6657409667969},{"Y":32.76959991455078,"X":599.0675659179688,"Z":-366.048828125},{"Y":30.405012130737306,"X":593.724609375,"Z":-363.8085632324219},{"Y":25.67985725402832,"X":588.4216918945313,"Z":-359.5290222167969},{"Y":19.04341697692871,"X":585.6258544921875,"Z":-356.93426513671877},{"Y":7.903454303741455,"X":589.81494140625,"Z":-352.81524658203127},{"Y":0.2784448266029358,"X":591.1484375,"Z":-354.2201843261719},{"Y":-7.115119457244873,"X":596.0895385742188,"Z":-356.0409851074219},{"Y":-7.654308319091797,"X":605.006103515625,"Z":-358.0293273925781},{"Y":-7.34372091293335,"X":631.4721069335938,"Z":-374.9562683105469},{"Y":-7.577934741973877,"X":611.0699462890625,"Z":-377.0044860839844},{"Y":-6.304628849029541,"X":600.96826171875,"Z":-378.3658752441406},{"Y":-4.011232376098633,"X":591.3900146484375,"Z":-380.7434387207031},{"Y":0.07750910520553589,"X":583.5029296875,"Z":-384.8182373046875},{"Y":4.953723430633545,"X":576.4193725585938,"Z":-386.7500915527344},{"Y":7.893801212310791,"X":568.2106323242188,"Z":-385.67413330078127},{"Y":12.208050727844239,"X":563.7592163085938,"Z":-380.59246826171877},{"Y":12.238241195678711,"X":562.553466796875,"Z":-375.88818359375},{"Y":8.282784461975098,"X":561.587890625,"Z":-368.47979736328127},{"Y":5.471288204193115,"X":561.6419677734375,"Z":-363.56573486328127},{"Y":3.905642032623291,"X":561.962158203125,"Z":-359.9250793457031},{"Y":1.5343966484069825,"X":561.2229614257813,"Z":-354.60797119140627},{"Y":-2.3782637119293215,"X":559.2047119140625,"Z":-347.13177490234377},{"Y":-2.6067535877227785,"X":559.371337890625,"Z":-338.9902038574219},{"Y":-3.2687695026397707,"X":559.9981079101563,"Z":-331.1598205566406},{"Y":-3.522292375564575,"X":563.4826049804688,"Z":-314.94427490234377},{"Y":-3.3114078044891359,"X":568.5322265625,"Z":-293.76953125},{"Y":-3.367293119430542,"X":572.1756591796875,"Z":-277.33953857421877},{"Y":-3.367293119430542,"X":572.1756591796875,"Z":-277.33953857421877},{"Y":-4.186720848083496,"X":574.5633544921875,"Z":-266.6298522949219},{"Y":-7.164914131164551,"X":574.768798828125,"Z":-260.029296875},{"Y":-9.94495964050293,"X":574.2892456054688,"Z":-252.2447967529297},{"Y":-7.147627830505371,"X":577.6104125976563,"Z":-243.52622985839845},{"Y":-4.273177146911621,"X":579.8597412109375,"Z":-239.5366668701172},{"Y":-0.9811333417892456,"X":586.4988403320313,"Z":-238.30621337890626},{"Y":2.1979405879974367,"X":592.9362182617188,"Z":-235.26979064941407},{"Y":8.812777519226075,"X":596.9423828125,"Z":-233.41819763183595},{"Y":11.924480438232422,"X":598.7369995117188,"Z":-228.4697265625},{"Y":14.125399589538575,"X":601.9135131835938,"Z":-220.12728881835938},{"Y":19.10040283203125,"X":605.4279174804688,"Z":-212.10153198242188},{"Y":25.176088333129884,"X":608.4249267578125,"Z":-206.10357666015626},{"Y":27.94637107849121,"X":610.0440673828125,"Z":-200.43199157714845},{"Y":32.835933685302737,"X":612.1253662109375,"Z":-196.29925537109376},{"Y":32.44699478149414,"X":616.8167724609375,"Z":-190.21388244628907},{"Y":31.4786376953125,"X":623.2613525390625,"Z":-184.420166015625},{"Y":32.43003845214844,"X":630.2034912109375,"Z":-181.13832092285157},{"Y":30.99116325378418,"X":638.1097412109375,"Z":-180.41041564941407},{"Y":31.55504035949707,"X":645.4293823242188,"Z":-182.11007690429688},{"Y":32.66874313354492,"X":662.5979614257813,"Z":-184.5323486328125},{"Y":32.08937072753906,"X":655.0258178710938,"Z":-179.6757049560547},{"Y":27.894010543823243,"X":646.5903930664063,"Z":-173.59210205078126},{"Y":23.274242401123048,"X":644.79833984375,"Z":-168.70004272460938},{"Y":21.253787994384767,"X":644.7915649414063,"Z":-166.2505645751953},{"Y":11.417163848876954,"X":644.1526489257813,"Z":-159.72732543945313},{"Y":8.358539581298829,"X":644.7313232421875,"Z":-155.18092346191407},{"Y":2.302488088607788,"X":644.793701171875,"Z":-148.8055419921875},{"Y":-3.5806586742401125,"X":644.66748046875,"Z":-142.7395782470703},{"Y":-4.005170822143555,"X":646.4615478515625,"Z":-135.19970703125},{"Y":-4.697624206542969,"X":646.4005126953125,"Z":-127.2938003540039},{"Y":-4.32395076751709,"X":646.9248046875,"Z":-118.90447235107422},{"Y":-8.55913257598877,"X":647.2559814453125,"Z":-108.5077896118164},{"Y":-8.55596923828125,"X":647.2559814453125,"Z":-108.5077896118164},{"Y":-9.48869514465332,"X":646.9788208007813,"Z":-99.30377197265625},{"Y":-9.860228538513184,"X":646.4542236328125,"Z":-95.72547149658203},{"Y":-11.410893440246582,"X":645.562744140625,"Z":-91.26366424560547},{"Y":-11.09369945526123,"X":645.5185546875,"Z":-72.81805419921875},{"Y":-11.024950981140137,"X":644.992919921875,"Z":-59.21836853027344},{"Y":-11.382179260253907,"X":643.4741821289063,"Z":-40.31110382080078},{"Y":-11.03435230255127,"X":642.330078125,"Z":-25.709291458129884},{"Y":-11.497270584106446,"X":641.4555053710938,"Z":-7.056362152099609},{"Y":-11.871397972106934,"X":640.905517578125,"Z":8.268196105957032},{"Y":-11.010385513305664,"X":640.3984375,"Z":27.118892669677736},{"Y":-11.644389152526856,"X":638.3928833007813,"Z":45.681129455566409},{"Y":-11.106142044067383,"X":636.39013671875,"Z":64.61483001708985},{"Y":-11.362351417541504,"X":634.5814819335938,"Z":83.12220764160156},{"Y":-11.286349296569825,"X":632.938720703125,"Z":101.87014770507813},{"Y":-11.534514427185059,"X":632.2152099609375,"Z":120.7202377319336},{"Y":-11.391797065734864,"X":631.4008178710938,"Z":139.34609985351563},{"Y":-11.08894157409668,"X":630.65625,"Z":158.05442810058595},{"Y":-11.631275177001954,"X":629.3253173828125,"Z":176.9663543701172},{"Y":-11.266690254211426,"X":627.623291015625,"Z":195.33714294433595},{"Y":-11.183404922485352,"X":627.2799682617188,"Z":205.74514770507813},{"Y":-10.383576393127442,"X":626.8450317382813,"Z":223.91310119628907},{"Y":-11.213651657104493,"X":625.46630859375,"Z":243.0272979736328},{"Y":-10.98790454864502,"X":623.5809936523438,"Z":257.974609375},{"Y":-7.547183036804199,"X":622.4061889648438,"Z":265.16302490234377},{"Y":-4.007143020629883,"X":621.6611938476563,"Z":271.14862060546877},{"Y":-3.003608226776123,"X":618.7416381835938,"Z":280.0407409667969},{"Y":-3.000000238418579,"X":617.4258422851563,"Z":288.65008544921877},{"Y":-3.1499502658843996,"X":615.1802368164063,"Z":296.2956848144531},{"Y":1.6857802867889405,"X":613.0372314453125,"Z":303.2129821777344},{"Y":9.261282920837403,"X":611.2582397460938,"Z":309.311767578125},{"Y":9.940213203430176,"X":608.3661499023438,"Z":311.0730895996094},{"Y":11.64954948425293,"X":604.21435546875,"Z":313.6955871582031},{"Y":12.710599899291993,"X":600.55517578125,"Z":320.6769104003906},{"Y":14.434556007385254,"X":597.896728515625,"Z":336.1676330566406},{"Y":16.02308464050293,"X":595.77734375,"Z":346.8341369628906},{"Y":16.16950225830078,"X":594.2135620117188,"Z":352.7707824707031},{"Y":16.77914810180664,"X":591.7244262695313,"Z":358.9396057128906},{"Y":15.081442832946778,"X":589.6881103515625,"Z":367.18536376953127},{"Y":15.533287048339844,"X":588.573974609375,"Z":370.4232482910156},{"Y":14.071104049682618,"X":587.5665283203125,"Z":375.6051025390625},{"Y":12.988398551940918,"X":586.5177612304688,"Z":380.2956848144531},{"Y":11.829174041748047,"X":584.763916015625,"Z":385.9291687011719},{"Y":11.400152206420899,"X":583.8115844726563,"Z":389.6884765625},{"Y":11.619799613952637,"X":582.1160888671875,"Z":394.5209045410156},{"Y":11.747761726379395,"X":574.7791748046875,"Z":396.45928955078127},{"Y":10.251062393188477,"X":571.67626953125,"Z":394.7828063964844},{"Y":7.173548221588135,"X":568.2281494140625,"Z":393.0670166015625},{"Y":4.083191394805908,"X":562.7876586914063,"Z":390.0881652832031},{"Y":-3.051020860671997,"X":560.2130737304688,"Z":387.6810607910156},{"Y":-3.000000238418579,"X":552.68505859375,"Z":384.4348449707031},{"Y":-3.000000238418579,"X":542.7852783203125,"Z":378.5755310058594},{"Y":-3.000000238418579,"X":531.3385620117188,"Z":370.06646728515627},{"Y":-3.000000238418579,"X":510.285888671875,"Z":356.1575012207031},{"Y":-3,"X":496.8291015625,"Z":347.5400390625},{"Y":-3.1725375652313234,"X":469.9456787109375,"Z":331.68560791015627},{"Y":-3.956916570663452,"X":458.50860595703127,"Z":323.9751281738281},{"Y":-11.411989212036133,"X":444.0636901855469,"Z":314.89825439453127},{"Y":-11.143885612487793,"X":431.735595703125,"Z":306.84832763671877},{"Y":-11.65377426147461,"X":393.5716247558594,"Z":282.42352294921877},{"Y":-11.673539161682129,"X":382.6662902832031,"Z":274.0207824707031},{"Y":-11.194883346557618,"X":366.7513427734375,"Z":263.9967041015625},{"Y":-11.016196250915528,"X":355.5671081542969,"Z":256.60968017578127},{"Y":-11.547551155090332,"X":340.2814025878906,"Z":246.1788330078125},{"Y":-11.021678924560547,"X":325.8612060546875,"Z":237.08705139160157},{"Y":-11.890448570251465,"X":309.27197265625,"Z":228.5190887451172},{"Y":-11.739446640014649,"X":293.71710205078127,"Z":218.54505920410157},{"Y":-11.502012252807618,"X":277.497314453125,"Z":208.87095642089845},{"Y":-11.325456619262696,"X":261.4328308105469,"Z":199.32765197753907},{"Y":-11.078137397766114,"X":246.05137634277345,"Z":188.85401916503907},{"Y":-11.000089645385743,"X":230.20928955078126,"Z":178.47634887695313},{"Y":-11.665740013122559,"X":214.16583251953126,"Z":168.685302734375},{"Y":-8.946468353271485,"X":198.3385467529297,"Z":158.92544555664063},{"Y":-3.304403066635132,"X":182.470458984375,"Z":149.62533569335938},{"Y":-3.007824182510376,"X":175.86062622070313,"Z":144.8979949951172},{"Y":-3.0343470573425295,"X":166.01708984375,"Z":139.19546508789063},{"Y":-3.071733236312866,"X":153.43099975585938,"Z":132.7880859375},{"Y":-3.1186985969543459,"X":138.7176055908203,"Z":126.54630279541016},{"Y":-3.000000238418579,"X":117.83965301513672,"Z":115.89573669433594},{"Y":-3.000000238418579,"X":77.2156982421875,"Z":106.68091583251953},{"Y":-3.000000238418579,"X":70.66650390625,"Z":103.67533111572266},{"Y":-3.000000238418579,"X":63.50795364379883,"Z":97.91498565673828},{"Y":-3.000000238418579,"X":53.38089370727539,"Z":93.79129028320313},{"Y":-3.000000238418579,"X":40.25814437866211,"Z":88.00508880615235},{"Y":-3.000000238418579,"X":21.159679412841798,"Z":82.34745788574219},{"Y":-3.458693504333496,"X":-0.06456401199102402,"Z":79.6906967163086},{"Y":-6.174127101898193,"X":-14.922796249389649,"Z":77.94922637939453},{"Y":-7.076498508453369,"X":-26.608783721923829,"Z":76.34392547607422},{"Y":-7.111432075500488,"X":-40.46284484863281,"Z":74.24213409423828},{"Y":-7.0095953941345219,"X":-53.032432556152347,"Z":74.06696319580078},{"Y":-7.000001430511475,"X":-60.42548370361328,"Z":73.28680419921875},{"Y":-6.0251007080078129,"X":-67.35469055175781,"Z":74.40441131591797},{"Y":-3.140596389770508,"X":-71.56989288330078,"Z":74.41835021972656},{"Y":-3.0000007152557375,"X":-77.71530151367188,"Z":74.33600616455078},{"Y":-3.0839335918426515,"X":-85.92546844482422,"Z":74.2855224609375},{"Y":-5.552220821380615,"X":-94.31825256347656,"Z":71.78047943115235},{"Y":-8.15986442565918,"X":-96.9466552734375,"Z":65.30899810791016},{"Y":-10.660785675048829,"X":-98.4531021118164,"Z":61.374996185302737},{"Y":-13.750649452209473,"X":-99.42858123779297,"Z":56.4643440246582},{"Y":-16.038759231567384,"X":-97.95509338378906,"Z":50.31316375732422},{"Y":-16.743616104125978,"X":-93.68504333496094,"Z":40.87928009033203},{"Y":-23.146055221557618,"X":-91.07108306884766,"Z":34.73562240600586},{"Y":-27.000001907348634,"X":-93.15514373779297,"Z":25.18101692199707},{"Y":-28.540264129638673,"X":-95.5604476928711,"Z":16.29629898071289},{"Y":-30.207796096801759,"X":-97.37849426269531,"Z":13.972580909729004},{"Y":-35.0000114440918,"X":-101.88172149658203,"Z":6.114368915557861},{"Y":-35.0093879699707,"X":-106.10186767578125,"Z":-3.9213547706604006},{"Y":-35.24341583251953,"X":-111.19701385498047,"Z":-14.333916664123536},{"Y":-37.2166748046875,"X":-112.69361877441406,"Z":-18.16156005859375},{"Y":-49.20759582519531,"X":-114.88233184814453,"Z":-24.23019790649414},{"Y":-47.00000762939453,"X":-115.47897338867188,"Z":-30.973058700561525},{"Y":-47,"X":-120.17218780517578,"Z":-41.77866744995117},{"Y":-47,"X":-125.2392807006836,"Z":-107.58003234863281},{"Y":-44.04908752441406,"X":-125.94053649902344,"Z":-115.7935791015625},{"Y":-38.43821334838867,"X":-127.03827667236328,"Z":-120.39546966552735},{"Y":-35.865264892578128,"X":-126.82592010498047,"Z":-126.65568542480469}]}]==]
-    do
-        pcall(function()
-            if type(isfolder) == "function" and type(writefile) == "function" then
-                if not isfolder("ASTERTween") then makefolder("ASTERTween") end
-                -- siempre se reescribe con la ruta incluida en el script (la ruta "5" fija)
-                writefile("ASTERTween/" .. EMBEDDED_ROUTE_NAME .. ".json", EMBEDDED_ROUTE_JSON)
-            end
-        end)
-        local routeJson = EMBEDDED_ROUTE_JSON
-        local okR, dataR = pcall(function() return httpservice:JSONDecode(routeJson) end)
-        if okR and type(dataR) == "table" and type(dataR.positions) == "table" then
-            Settings.recordedPositions = dataR.positions
-        end
-    end
-    local pathDefault = "None"
-    pcall(function()
-        for _, n in ipairs(getGoldPathList()) do
-            if n == EMBEDDED_ROUTE_NAME then pathDefault = n end
-        end
-    end)
-    ASTER.Options.GlobalPathDropdown = ASTER.Tabs.Main:AddDropdown("Select Path", getGoldPathList(), pathDefault, function(v)
+
+do
+    WaypointUI:AddLabel("Path Management")
+    WaypointUI.Options.GlobalPathDropdown = WaypointUI:AddDropdown("Select Path", getGoldPathList(), "None", function(v)
         if v == "None" then
             Settings.recordedPositions = {}
             updateVisualNodes()
-            if ASTER.Options.WaypointDropdown then
-                ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-                ASTER.Options.WaypointDropdown:SetValue("None")
+            if WaypointUI.Options.WaypointDropdown then 
+                WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+                WaypointUI.Options.WaypointDropdown:SetValue("None")
             end
         else
-            if loadPath(v) then
-                updateVisualNodes()
-                if ASTER.Options.WaypointDropdown then
-                    ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-                    ASTER.Options.WaypointDropdown:SetValue("None")
+            if loadPath(v) then 
+                updateVisualNodes() 
+                if WaypointUI.Options.WaypointDropdown then 
+                    WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+                    WaypointUI.Options.WaypointDropdown:SetValue("None")
                 end
             end
         end
     end)
 
-    ASTER.Tabs.Main:AddInput("InputPath", "", function(v)
+    -- Paste waypoints directly instead of selecting a saved file. Accepts the full
+    -- saved-path JSON ({"positions":[...]}), a bare array of points, or plain
+    -- coordinate triples like "x,y,z x,y,z" / "Vector3.new(x,y,z), ...".
+    WaypointUI:AddInput("InputPath", "", function(v)
         if not v or v == "" then return end
         local positions
 
@@ -4186,29 +1476,32 @@ do
         if #clean > 0 then
             Settings.recordedPositions = clean
             updateVisualNodes()
-
-            if ASTER.Options.WaypointDropdown then
-                ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-                ASTER.Options.WaypointDropdown:SetValue("None")
+            -- NOTE: don't call GlobalPathDropdown:SetValue("None") here - SetValue fires
+            -- its callback, whose "None" branch would wipe the positions we just loaded.
+            if WaypointUI.Options.WaypointDropdown then
+                WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+                WaypointUI.Options.WaypointDropdown:SetValue("None")
             end
         end
     end)
 
-    ASTER.Tabs.Main:AddInput("New Path Name", "", function(v)
+
+
+    WaypointUI:AddInput("New Path Name", "", function(v)
         Settings.CustomPathName = v
     end)
 
-    ASTER.Tabs.Main:AddButton("Save/Create Path", function()
+    WaypointUI:AddButton("Save/Create Path", function()
         local name = Settings.CustomPathName
         if not name or name == "" then
             name = "GoldCircuit_"..os.date("%H%M%S")
         end
         saveCurrentPath(name)
-        if ASTER.Options.GlobalPathDropdown then ASTER.Options.GlobalPathDropdown:SetValues(getGoldPathList()) end
+        if WaypointUI.Options.GlobalPathDropdown then WaypointUI.Options.GlobalPathDropdown:SetValues(getGoldPathList()) end
     end)
 
-    ASTER.Tabs.Main:AddButton("Delete Selected Path", function()
-        local pathName = ASTER.Options.GlobalPathDropdown:GetValue()
+    WaypointUI:AddButton("Delete Selected Path", function()
+        local pathName = WaypointUI.Options.GlobalPathDropdown:GetValue()
         if pathName and pathName ~= "None" then
             local pathFolder = "ASTERTween"
             local filePath = pathFolder .. "/" .. pathName .. ".json"
@@ -4216,22 +1509,22 @@ do
                 if delfile then delfile(filePath) elseif deletefile then deletefile(filePath) end
                 Settings.recordedPositions = {}
                 updateVisualNodes()
-                if ASTER.Options.GlobalPathDropdown then
-                   ASTER.Options.GlobalPathDropdown:SetValues(getGoldPathList())
-                   ASTER.Options.GlobalPathDropdown:SetValue("None")
+                if WaypointUI.Options.GlobalPathDropdown then 
+                   WaypointUI.Options.GlobalPathDropdown:SetValues(getGoldPathList()) 
+                   WaypointUI.Options.GlobalPathDropdown:SetValue("None")
                 end
             end
         end
     end)
 
-    ASTER.Tabs.Main:AddButton("Refresh Path List", function()
-        if ASTER.Options.GlobalPathDropdown then ASTER.Options.GlobalPathDropdown:SetValues(getGoldPathList()) end
+    WaypointUI:AddButton("Refresh Path List", function()
+        if WaypointUI.Options.GlobalPathDropdown then WaypointUI.Options.GlobalPathDropdown:SetValues(getGoldPathList()) end
     end)
 end
 
 do
-    ASTER.Tabs.Main:AddLabel("Waypoint Editor")
-    function ASTER.getWaypointList()
+    WaypointUI:AddLabel("Waypoint Editor")
+    function WaypointUI.getWaypointList()
         local t = {}
         if Settings.recordedPositions then
             for i=1, #Settings.recordedPositions do table.insert(t, tostring(i)) end
@@ -4240,18 +1533,37 @@ do
         return t
     end
 
-    ASTER.Options.WaypointDropdown = ASTER.Tabs.Main:AddDropdown("Select Waypoint", ASTER.getWaypointList(), "None", function(v)
+    WaypointUI.Options.WaypointDropdown = WaypointUI:AddDropdown("Select Waypoint", WaypointUI.getWaypointList(), "None", function(v)
         Settings.SelectedWaypointIndex = tonumber(v)
     end)
 
-    ASTER.Tabs.Main:AddButton("Refresh Waypoint List", function()
-        if ASTER.Options.WaypointDropdown then
-            ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-            ASTER.Options.WaypointDropdown:SetValue("None")
+    -- Buscar un waypoint por su numero: lo selecciona en el dropdown y muestra su posicion
+    local searchInfo
+    WaypointUI:AddInput("Buscar waypoint #", "", function(text)
+        local list = Settings.recordedPositions
+        local total = list and #list or 0
+        local n = math.floor(tonumber(text) or 0)
+        if n >= 1 and n <= total then
+            if WaypointUI.Options.WaypointDropdown then
+                WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+                WaypointUI.Options.WaypointDropdown:SetValue(tostring(n))
+            end
+            local pos = list[n]
+            searchInfo.Text = string.format("#%d de %d  (%.0f, %.0f, %.0f)", n, total, pos.X, pos.Y, pos.Z)
+        else
+            searchInfo.Text = "No existe (hay " .. total .. ")"
+        end
+    end)
+    searchInfo = WaypointUI:AddLabel("Resultado: -")
+    
+    WaypointUI:AddButton("Refresh Waypoint List", function()
+        if WaypointUI.Options.WaypointDropdown then 
+            WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+            WaypointUI.Options.WaypointDropdown:SetValue("None")
         end
     end)
 
-    ASTER.Tabs.Main:AddButton("Move Selected Waypoint Here", function()
+    WaypointUI:AddButton("Move Selected Waypoint Here", function()
         local idx = Settings.SelectedWaypointIndex
         if idx and Settings.recordedPositions and Settings.recordedPositions[idx] then
              local character = game:GetService("Players").LocalPlayer.Character
@@ -4263,23 +1575,23 @@ do
         end
     end)
 
-    ASTER.Tabs.Main:AddButton("Delete Selected Waypoint", function()
+    WaypointUI:AddButton("Delete Selected Waypoint", function()
         local idx = Settings.SelectedWaypointIndex
         if idx and Settings.recordedPositions and Settings.recordedPositions[idx] then
              table.remove(Settings.recordedPositions, idx)
              updateVisualNodes()
-             if ASTER.Options.WaypointDropdown then
-                ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
-                ASTER.Options.WaypointDropdown:SetValue("None")
+             if WaypointUI.Options.WaypointDropdown then 
+                WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+                WaypointUI.Options.WaypointDropdown:SetValue("None")
              end
         end
     end)
-
-    ASTER.Tabs.Main:AddSlider("Waypoint Wait Time", 0, 10, 0, 0.01, function(v)
+    
+    WaypointUI:AddSlider("Waypoint Wait Time", 0, 10, 0, 0.01, function(v)
         Settings.WaypointWaitTime = v
     end)
 
-    ASTER.Tabs.Main:AddButton("Set Wait to Selected Waypoint", function()
+    WaypointUI:AddButton("Set Wait to Selected Waypoint", function()
         local idx = Settings.SelectedWaypointIndex
         if idx and Settings.recordedPositions and Settings.recordedPositions[idx] then
              Settings.recordedPositions[idx].waitTime = Settings.WaypointWaitTime or 0
@@ -4288,7 +1600,7 @@ do
 end
 
 do
-    ASTER.Tabs.Main:AddLabel("Path Recorder")
+    WaypointUI:AddLabel("Path Recorder")
     if not __ASTER_RUNTIME.waypointDropdownLoopStarted then
         __ASTER_RUNTIME.waypointDropdownLoopStarted = true
         local session = CURRENT_SESSION
@@ -4296,8 +1608,8 @@ do
             while isRuntimeSessionActive(session) do
                 if Settings.needsDropdownUpdate then
                     Settings.needsDropdownUpdate = false
-                    if ASTER.Options.WaypointDropdown then
-                        ASTER.Options.WaypointDropdown:SetValues(ASTER.getWaypointList())
+                    if WaypointUI.Options.WaypointDropdown then 
+                        WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
                     end
                 end
                 task.wait(2)
@@ -4305,7 +1617,7 @@ do
         end)
     end
 
-    ASTER.Tabs.Main:AddToggle("Auto Record Path", false, function(v)
+    WaypointUI:AddToggle("Auto Record Path", false, function(v)
         Settings.recordingPath = v
         if v then
             task.spawn(function()
@@ -4332,11 +1644,11 @@ do
         end
     end)
 
-    ASTER.Tabs.Main:AddSlider("Recording Interval", 0.1, 5, 1, 0.1, function(v)
+    WaypointUI:AddSlider("Recording Interval", 0.1, 5, 1, 0.1, function(v)
         Settings.recordInterval = v
     end)
 
-    ASTER.Tabs.Main:AddButton("Add Manual Waypoint", function()
+    WaypointUI:AddButton("Add Manual Waypoint", function()
          local player = game:GetService("Players").LocalPlayer
          local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
          if hrp then
@@ -4347,116 +1659,2215 @@ do
          end
     end)
 
-    ASTER.Tabs.Main:AddButton("Clear Path", function()
+    WaypointUI:AddButton("Clear Path", function()
         Settings.recordedPositions = {}
         updateVisualNodes()
     end)
 
+
+
 end
 
-        ASTER.Tabs.Pickup:AddToggle("Auto Drop", false, function(v)
-        Settings.AutoDropEnabled = v
-    end)
-    ASTER.Tabs.Pickup:AddInput("Item to Drop", "", function(v)
-        Settings.DropItem = v
-    end)
-    ASTER.Tabs.Pickup:AddInput("DropAmount", "Infinite", function(v)
-        local amount = tonumber(v)
-        if amount and amount > 0 then
-            Settings.DropAmount = math.floor(amount)
-        else
-            Settings.DropAmount = "Infinite"
+do
+    WaypointUI:AddButton("5NodeTween", function()
+        Settings.recordedPositions = {
+            { Y = -3.000000476837158, X = 950.5995483398438, waitTime = 1.04, Z = -1387.773681640625 },
+            { Y = -2.826885938644409, X = 969.7044067382813, waitTime = 1.04, Z = -1409.90087890625 },
+            { Y = -2.7845659255981447, X = 948.4840698242188, waitTime = 1.04, Z = -1432.767578125 },
+            { Y = -1.1912038326263428, X = 912.9176635742188, waitTime = 1.04, Z = -1426.2274169921876 },
+            { Y = -3.000000238418579, X = 918.389892578125, waitTime = 1.04, Z = -1396.9947509765626 },
+        }
+
+        if updateVisualNodes then updateVisualNodes() end
+        if WaypointUI.Options.WaypointDropdown and WaypointUI.getWaypointList then
+            WaypointUI.Options.WaypointDropdown:SetValues(WaypointUI.getWaypointList())
+            WaypointUI.Options.WaypointDropdown:SetValue("None")
         end
     end)
 
-    -- ===== ITEM TOOLS (menu) =====
-    do
-        local IT = ItemTools
-        local tab = ASTER.Tabs.Pickup
+    WaypointUI:AddToggle("Start5NodeFarm", false, function(v)
+        Settings.GoldCircuitEnabled = v
+        if WaypointUI.Registry["Start Tween"] and WaypointUI.Registry["Start Tween"].SetValue then
+            WaypointUI.Registry["Start Tween"].SetValue(v)
+        end
+        if v then startGoldCircuit() else stopGoldCircuit() end
+    end)
+end
 
-        tab:AddLabel("Auto Item Deletion")
-        tab:AddToggle("Enable Item Deletion", true, function(v) IT.cfg.deleteEnabled = (v == true) end)
-        tab:AddSlider("Deletion Range", 1, 25, 25, 1, function(v) IT.cfg.deleteRange = v end)
-        tab:AddInput("Deletion Targets (coma o All)", "Log, Stone, Raw Iron, Coal, Wood, Leaves,", function(v) IT.cfg.deleteTargets = v end)
-
-        tab:AddLabel("Auto Craft")
-        tab:AddToggle("Enable Auto Craft", true, function(v) IT.cfg.craftEnabled = (v == true) end)
-        tab:AddToggle("Use Amount", false, function(v) IT.cfg.craftUseAmount = (v == true) end)
-        tab:AddInput("Craft Object (nombre exacto)", "Leaf Shirt", function(v) IT.cfg.craftObject = v end)
-        tab:AddInput("Craft Amount", "1", function(v) IT.cfg.craftAmount = tonumber(v) or 1 end)
-        tab:AddSlider("Craft Delay", 0.01, 2, 0.05, 0.01, function(v) IT.cfg.craftDelay = v end)
-
-        tab:AddLabel("Items Into Chest")
-        tab:AddToggle("Select Chest (tap a chest)", false, function(v) IT.setSelecting(v == true) end)
-        tab:AddToggle("Auto Insert Items", true, function(v) IT.cfg.chestEnabled = (v == true) end)
-        tab:AddInput("Chest Targets (coma o All)", "Raw Gold", function(v) IT.cfg.chestTargets = v end)
-        local st = tab:AddLabel(IT.status)
-        st.TextSize = 12
-        st.TextColor3 = Color3.fromRGB(170, 170, 170)
-        IT.statusLabel = st
+-- ===== Ruta cargada automaticamente (657 waypoints) =====
+do
+    local EMBEDDED_ROUTE = [==[
+{"positions":[
+  {"Y":-36.097564697265625,"X":-17.87895965576172,"Z":-69.6917495727539},
+  {"Y":-35.0615119934082,"X":-28.11099624633789,"Z":-79.33507537841797},
+  {"Y":-35.717041015625,"X":-62.5265998840332,"Z":-111.12274932861328},
+  {"Y":-35.180057525634766,"X":-78.44056701660156,"Z":-126.59168243408203},
+  {"Y":-35.00108337402344,"X":-109.9499282836914,"Z":-151.14999389648438},
+  {"Y":-34.513004302978516,"X":-140.97605895996094,"Z":-172.3174591064453},
+  {"Y":-33.513004302978516,"X":-143.94281005859375,"Z":-179.9051055908203},
+  {"Y":-26.047304153442383,"X":-146.2490234375,"Z":-185.53282165527344},
+  {"Y":-17.297964096069336,"X":-145.8536376953125,"Z":-191.34654235839844},
+  {"Y":-23.848613739013672,"X":-140.6541748046875,"Z":-190.62557983398438},
+  {"Y":-32.70119857788086,"X":-135.28668212890625,"Z":-189.61473083496094},
+  {"Y":-35.000003814697266,"X":-123.0405044555664,"Z":-184.02685546875},
+  {"Y":-28.590084075927734,"X":-115.40453338623047,"Z":-181.65164184570312},
+  {"Y":-34.08949279785156,"X":-112.33467864990234,"Z":-173.7101287841797},
+  {"Y":-35.000003814697266,"X":-102.24323272705078,"Z":-155.57656860351562},
+  {"Y":-35.718753814697266,"X":-58.51434326171875,"Z":-114.05269622802734},
+  {"Y":-35.000003814697266,"X":-36.701656341552734,"Z":-93.55331420898438},
+  {"Y":-34.922935485839844,"X":-25.06293487548828,"Z":-88.25690460205078},
+  {"Y":-36.59028625488281,"X":-15.55826187133789,"Z":-84.41770935058594},
+  {"Y":-35.23943328857422,"X":0.980724573135376,"Z":-77.46920776367188},
+  {"Y":-35.545108795166016,"X":42.662105560302734,"Z":-61.125877380371094},
+  {"Y":-36.4157829284668,"X":49.337745666503906,"Z":-59.37546920776367},
+  {"Y":-39.165740966796875,"X":52.52009201049805,"Z":-58.21722412109375},
+  {"Y":-40.74739074707031,"X":55.606178283691406,"Z":-57.11269760131836},
+  {"Y":-44.67189025878906,"X":61.3894157409668,"Z":-56.68795394897461},
+  {"Y":-48.53031539916992,"X":67.19034576416016,"Z":-63.01583480834961},
+  {"Y":-52.8969612121582,"X":71.72045135498047,"Z":-70.34941864013672},
+  {"Y":-56.65664291381836,"X":74.4097900390625,"Z":-78.0643310546875},
+  {"Y":-59.7680778503418,"X":75.59027099609375,"Z":-87.4146499633789},
+  {"Y":-63.792667388916016,"X":76.4576644897461,"Z":-95.5585708618164},
+  {"Y":-68.42304229736328,"X":75.75611114501953,"Z":-104.64850616455078},
+  {"Y":-72.80892181396484,"X":71.53912353515625,"Z":-121.32211303710938},
+  {"Y":-73.77214813232422,"X":68.39056396484375,"Z":-126.51982116699219},
+  {"Y":-75.22158813476562,"X":63.914005279541016,"Z":-129.9936065673828},
+  {"Y":-75.02980041503906,"X":45.852882385253906,"Z":-132.12472534179688},
+  {"Y":-74.53466033935547,"X":29.20977783203125,"Z":-115.6243667602539},
+  {"Y":-71.06640625,"X":21.02118492126465,"Z":-108.1218490600586},
+  {"Y":-74.80616760253906,"X":16.37548065185547,"Z":-104.5297622680664},
+  {"Y":-76.826416015625,"X":11.101197242736816,"Z":-98.31232452392578},
+  {"Y":-79.39002227783203,"X":8.299113273620605,"Z":-93.80474853515625},
+  {"Y":-82.99874114990234,"X":1.7012484073638916,"Z":-84.38813018798828},
+  {"Y":-79.98306274414062,"X":3.867070198059082,"Z":-69.81044006347656},
+  {"Y":-76.74279022216797,"X":5.722278118133545,"Z":-62.838497161865234},
+  {"Y":-75.76138305664062,"X":7.920065402984619,"Z":-56.74689483642578},
+  {"Y":-75.03189086914062,"X":9.579243659973145,"Z":-42.71484375},
+  {"Y":-75.00352478027344,"X":3.101607322692871,"Z":-36.630069732666016},
+  {"Y":-75.31417846679688,"X":-15.877350807189941,"Z":-39.81624984741211},
+  {"Y":-75.67532348632812,"X":-25.384572982788086,"Z":-43.171077728271484},
+  {"Y":-75.009033203125,"X":-30.527376174926758,"Z":-52.40476608276367},
+  {"Y":-75.00000762939453,"X":-37.75537872314453,"Z":-64.80815887451172},
+  {"Y":-75.00035858154297,"X":-48.780609130859375,"Z":-70.68029022216797},
+  {"Y":-75.79022216796875,"X":-56.188961029052734,"Z":-72.59537506103516},
+  {"Y":-76.98753356933594,"X":-60.13935470581055,"Z":-71.52422332763672},
+  {"Y":-83.00994110107422,"X":-63.805328369140625,"Z":-68.23323059082031},
+  {"Y":-87.46012115478516,"X":-66.26478576660156,"Z":-62.35783386230469},
+  {"Y":-91.19818115234375,"X":-60.143253326416016,"Z":-51.68317413330078},
+  {"Y":-90.09002685546875,"X":-57.51213455200195,"Z":-46.46467971801758},
+  {"Y":-90.40168762207031,"X":-54.99028015136719,"Z":-42.85733413696289},
+  {"Y":-92.56724548339844,"X":-54.17765808105469,"Z":-40.33122634887695},
+  {"Y":-95.67813873291016,"X":-47.8344612121582,"Z":-29.187332153320312},
+  {"Y":-94.4976806640625,"X":-44.50448226928711,"Z":-23.03543472290039},
+  {"Y":-95.11611938476562,"X":-39.32149887084961,"Z":-15.710384368896484},
+  {"Y":-95.31110382080078,"X":-33.139915466308594,"Z":-9.770121574401855},
+  {"Y":-93.09143829345703,"X":-27.177698135375977,"Z":-6.587636947631836},
+  {"Y":-94.79756164550781,"X":-32.01369094848633,"Z":-9.01773738861084},
+  {"Y":-95.26167297363281,"X":-38.61734390258789,"Z":-12.727347373962402},
+  {"Y":-93.84127807617188,"X":-45.15901565551758,"Z":-18.667314529418945},
+  {"Y":-94.40286254882812,"X":-49.78437805175781,"Z":-20.518037796020508},
+  {"Y":-95.2190933227539,"X":-72.30226135253906,"Z":-28.39202308654785},
+  {"Y":-95.14521789550781,"X":-107.11556243896484,"Z":-42.61137390136719},
+  {"Y":-95.78980255126953,"X":-133.89031982421875,"Z":-54.370338439941406},
+  {"Y":-95.38990020751953,"X":-186.22848510742188,"Z":-91.07901763916016},
+  {"Y":-95.04875946044922,"X":-206.8849639892578,"Z":-100.27751159667969},
+  {"Y":-95.01969909667969,"X":-213.45046997070312,"Z":-102.27188110351562},
+  {"Y":-92.1510238647461,"X":-217.74807739257812,"Z":-103.16495513916016},
+  {"Y":-89.34034729003906,"X":-219.48094177246094,"Z":-100.45182037353516},
+  {"Y":-87.65755462646484,"X":-222.96820068359375,"Z":-97.5285415649414},
+  {"Y":-86.400146484375,"X":-230.32107543945312,"Z":-94.32537841796875},
+  {"Y":-85.56954193115234,"X":-234.49598693847656,"Z":-95.0248031616211},
+  {"Y":-86.20861053466797,"X":-234.91062927246094,"Z":-96.36410522460938},
+  {"Y":-87.54962158203125,"X":-236.72337341308594,"Z":-95.72245788574219},
+  {"Y":-90.58854675292969,"X":-240.0164031982422,"Z":-95.6749267578125},
+  {"Y":-92.67257690429688,"X":-243.13568115234375,"Z":-94.9742202758789},
+  {"Y":-95.43948364257812,"X":-246.58038330078125,"Z":-93.223876953125},
+  {"Y":-95.85417938232422,"X":-260.7976379394531,"Z":-87.19376373291016},
+  {"Y":-99.03336334228516,"X":-275.30450439453125,"Z":-78.13667297363281},
+  {"Y":-98.1904525756836,"X":-284.6153869628906,"Z":-76.1724853515625},
+  {"Y":-96.21283721923828,"X":-287.86138916015625,"Z":-75.07992553710938},
+  {"Y":-95.06410217285156,"X":-296.6695251464844,"Z":-72.2030258178711},
+  {"Y":-95.13319396972656,"X":-308.9407958984375,"Z":-68.03433990478516},
+  {"Y":-93.74494171142578,"X":-319.5994873046875,"Z":-62.044288635253906},
+  {"Y":-91.98959350585938,"X":-325.0479431152344,"Z":-57.93803787231445},
+  {"Y":-91.05609893798828,"X":-332.0805358886719,"Z":-51.68510055541992},
+  {"Y":-91.8002700805664,"X":-326.35516357421875,"Z":-58.25112533569336},
+  {"Y":-92.62725067138672,"X":-320.62811279296875,"Z":-63.44654083251953},
+  {"Y":-94.87786865234375,"X":-316.7603454589844,"Z":-66.3921127319336},
+  {"Y":-95.86964416503906,"X":-310.5828552246094,"Z":-71.18344116210938},
+  {"Y":-95.15017700195312,"X":-300.8476867675781,"Z":-79.7458267211914},
+  {"Y":-95.09049224853516,"X":-290.0814208984375,"Z":-93.76136016845703},
+  {"Y":-94.68161010742188,"X":-282.2164306640625,"Z":-105.37223052978516},
+  {"Y":-93.67344665527344,"X":-278.5527038574219,"Z":-109.21057891845703},
+  {"Y":-94.9756088256836,"X":-275.8273010253906,"Z":-112.89608764648438},
+  {"Y":-95.22782897949219,"X":-270.97662353515625,"Z":-118.80455017089844},
+  {"Y":-95.2102279663086,"X":-235.69314575195312,"Z":-159.1427764892578},
+  {"Y":-95.29962158203125,"X":-226.5478973388672,"Z":-166.99398803710938},
+  {"Y":-94.96026611328125,"X":-223.95382690429688,"Z":-169.75721740722656},
+  {"Y":-95.49082946777344,"X":-221.4545135498047,"Z":-174.29251098632812},
+  {"Y":-95.51611328125,"X":-220.53163146972656,"Z":-178.19520568847656},
+  {"Y":-95.64567565917969,"X":-223.80142211914062,"Z":-184.4515838623047},
+  {"Y":-95.64767456054688,"X":-230.7017059326172,"Z":-194.28846740722656},
+  {"Y":-95.6803207397461,"X":-237.29061889648438,"Z":-207.34483337402344},
+  {"Y":-95.11738586425781,"X":-242.1846160888672,"Z":-218.36024475097656},
+  {"Y":-95.8185806274414,"X":-241.7867889404297,"Z":-225.20693969726562},
+  {"Y":-87.84711456298828,"X":-244.77288818359375,"Z":-229.85302734375},
+  {"Y":-84.41264343261719,"X":-246.5354766845703,"Z":-235.0667724609375},
+  {"Y":-83.07404327392578,"X":-242.14894104003906,"Z":-244.6227264404297},
+  {"Y":-83.00675201416016,"X":-232.12010192871094,"Z":-255.237060546875},
+  {"Y":-83.01465606689453,"X":-229.69158935546875,"Z":-260.97845458984375},
+  {"Y":-82.55633544921875,"X":-229.381103515625,"Z":-265.1445007324219},
+  {"Y":-80.41253662109375,"X":-230.74317932128906,"Z":-270.6502990722656},
+  {"Y":-79.11243438720703,"X":-234.92308044433594,"Z":-295.65863037109375},
+  {"Y":-78.79810333251953,"X":-236.6993408203125,"Z":-299.2177734375},
+  {"Y":-78.9940414428711,"X":-237.94131469726562,"Z":-302.6437072753906},
+  {"Y":-79.08631896972656,"X":-241.61131286621094,"Z":-319.5328674316406},
+  {"Y":-77.45620727539062,"X":-241.92491149902344,"Z":-325.4241943359375},
+  {"Y":-76.43376159667969,"X":-241.6328582763672,"Z":-329.8904724121094},
+  {"Y":-76.98069763183594,"X":-240.27154541015625,"Z":-333.3515625},
+  {"Y":-79.00000762939453,"X":-237.294921875,"Z":-338.5400085449219},
+  {"Y":-78.17758178710938,"X":-232.32461547851562,"Z":-345.2692565917969},
+  {"Y":-76.10971069335938,"X":-228.5795135498047,"Z":-349.49139404296875},
+  {"Y":-75.36909484863281,"X":-223.65281677246094,"Z":-354.87237548828125},
+  {"Y":-75.04910278320312,"X":-219.1317596435547,"Z":-360.1755065917969},
+  {"Y":-74.00711059570312,"X":-213.7140350341797,"Z":-366.33935546875},
+  {"Y":-72.24459075927734,"X":-210.28904724121094,"Z":-370.82293701171875},
+  {"Y":-71.48782348632812,"X":-206.9502716064453,"Z":-377.5299072265625},
+  {"Y":-71.27015686035156,"X":-203.58535766601562,"Z":-385.4100646972656},
+  {"Y":-70.5815658569336,"X":-201.47410583496094,"Z":-391.9834899902344},
+  {"Y":-69.34226989746094,"X":-199.81532287597656,"Z":-396.2769470214844},
+  {"Y":-68.30485534667969,"X":-198.341552734375,"Z":-399.189453125},
+  {"Y":-67.1475601196289,"X":-196.20648193359375,"Z":-405.96014404296875},
+  {"Y":-67.27498626708984,"X":-193.59925842285156,"Z":-413.32391357421875},
+  {"Y":-66.67404174804688,"X":-192.5446319580078,"Z":-417.9113464355469},
+  {"Y":-66.74925231933594,"X":-191.64205932617188,"Z":-427.5824279785156},
+  {"Y":-67.2940673828125,"X":-189.95240783691406,"Z":-437.8460998535156},
+  {"Y":-67.02113342285156,"X":-189.29241943359375,"Z":-464.7947082519531},
+  {"Y":-64.72180938720703,"X":-190.5485382080078,"Z":-471.30584716796875},
+  {"Y":-63.72323226928711,"X":-193.30474853515625,"Z":-478.32415771484375},
+  {"Y":-63.05461502075195,"X":-195.34823608398438,"Z":-484.8435974121094},
+  {"Y":-62.89060592651367,"X":-197.6260986328125,"Z":-492.9736022949219},
+  {"Y":-60.925601959228516,"X":-200.11380004882812,"Z":-501.9820861816406},
+  {"Y":-59.842506408691406,"X":-201.3069305419922,"Z":-506.677734375},
+  {"Y":-59.1169319152832,"X":-204.20997619628906,"Z":-511.79901123046875},
+  {"Y":-59.000003814697266,"X":-206.43276977539062,"Z":-517.2422485351562},
+  {"Y":-59.00811767578125,"X":-207.37051391601562,"Z":-530.5380249023438},
+  {"Y":-59.436492919921875,"X":-206.40786743164062,"Z":-533.510009765625},
+  {"Y":-60.48143005371094,"X":-203.9061737060547,"Z":-537.22314453125},
+  {"Y":-61.2838020324707,"X":-198.30105590820312,"Z":-541.9625854492188},
+  {"Y":-62.6893196105957,"X":-192.79458618164062,"Z":-546.874267578125},
+  {"Y":-62.539974212646484,"X":-188.2182159423828,"Z":-551.2115478515625},
+  {"Y":-63.674373626708984,"X":-183.96595764160156,"Z":-555.5897216796875},
+  {"Y":-63.66203689575195,"X":-180.2412567138672,"Z":-559.8143310546875},
+  {"Y":-63.51121139526367,"X":-178.34194946289062,"Z":-563.845458984375},
+  {"Y":-63.217350006103516,"X":-177.01344299316406,"Z":-569.0462646484375},
+  {"Y":-64.1656494140625,"X":-176.37693786621094,"Z":-574.5562744140625},
+  {"Y":-63.631412506103516,"X":-176.43167114257812,"Z":-581.854736328125},
+  {"Y":-63.00729751586914,"X":-176.70010375976562,"Z":-587.666748046875},
+  {"Y":-62.93288803100586,"X":-177.0845184326172,"Z":-594.0775756835938},
+  {"Y":-63.290523529052734,"X":-179.36814880371094,"Z":-600.0236206054688},
+  {"Y":-63.781986236572266,"X":-183.57997131347656,"Z":-605.2738037109375},
+  {"Y":-64.00740814208984,"X":-186.90322875976562,"Z":-608.8635864257812},
+  {"Y":-63.06130599975586,"X":-191.77662658691406,"Z":-612.3721313476562},
+  {"Y":-61.770748138427734,"X":-197.17019653320312,"Z":-616.0538940429688},
+  {"Y":-61.75991439819336,"X":-202.64306640625,"Z":-619.3583984375},
+  {"Y":-61.56159210205078,"X":-207.9905242919922,"Z":-622.8851928710938},
+  {"Y":-61.64213180541992,"X":-202.5828857421875,"Z":-619.9781494140625},
+  {"Y":-61.56515121459961,"X":-198.48252868652344,"Z":-617.7166748046875},
+  {"Y":-63.20347213745117,"X":-193.93800354003906,"Z":-614.2801513671875},
+  {"Y":-63.39158248901367,"X":-188.66493225097656,"Z":-609.9288940429688},
+  {"Y":-63.56820297241211,"X":-184.14398193359375,"Z":-606.8274536132812},
+  {"Y":-63.624149322509766,"X":-180.02938842773438,"Z":-602.0594482421875},
+  {"Y":-63.32640075683594,"X":-177.2948455810547,"Z":-596.109130859375},
+  {"Y":-62.874691009521484,"X":-176.69137573242188,"Z":-590.20068359375},
+  {"Y":-63.38675308227539,"X":-175.41400146484375,"Z":-582.8316650390625},
+  {"Y":-64.51220703125,"X":-175.260986328125,"Z":-576.8424072265625},
+  {"Y":-63.42831802368164,"X":-175.95094299316406,"Z":-570.2713012695312},
+  {"Y":-63.3984375,"X":-178.2561492919922,"Z":-565.19873046875},
+  {"Y":-63.76296615600586,"X":-180.1190643310547,"Z":-559.640380859375},
+  {"Y":-64.01393127441406,"X":-182.77403259277344,"Z":-555.7757568359375},
+  {"Y":-63.05409622192383,"X":-186.2442169189453,"Z":-551.982421875},
+  {"Y":-62.861412048339844,"X":-191.23175048828125,"Z":-547.4107055664062},
+  {"Y":-62.38056182861328,"X":-195.63284301757812,"Z":-543.8690185546875},
+  {"Y":-60.2612419128418,"X":-199.67115783691406,"Z":-542.5059814453125},
+  {"Y":-59.831756591796875,"X":-207.3677215576172,"Z":-542.3101806640625},
+  {"Y":-59.281829833984375,"X":-214.2286376953125,"Z":-542.9287719726562},
+  {"Y":-59.03789520263672,"X":-221.3056640625,"Z":-543.8336791992188},
+  {"Y":-59.08058166503906,"X":-226.54965209960938,"Z":-544.5911254882812},
+  {"Y":-59.33436584472656,"X":-241.40237426757812,"Z":-546.768798828125},
+  {"Y":-58.86677932739258,"X":-244.82855224609375,"Z":-548.1688232421875},
+  {"Y":-57.11024475097656,"X":-250.6344451904297,"Z":-549.6515502929688},
+  {"Y":-55.696990966796875,"X":-259.0316162109375,"Z":-552.6948852539062},
+  {"Y":-56.581138610839844,"X":-264.017578125,"Z":-554.9091186523438},
+  {"Y":-55.969913482666016,"X":-269.0810546875,"Z":-556.7428588867188},
+  {"Y":-57.812992095947266,"X":-275.6255798339844,"Z":-558.3749389648438},
+  {"Y":-56.87485122680664,"X":-280.85430908203125,"Z":-560.5892333984375},
+  {"Y":-56.78207778930664,"X":-288.2280578613281,"Z":-562.4149169921875},
+  {"Y":-56.15270233154297,"X":-296.9427490234375,"Z":-564.7374267578125},
+  {"Y":-55.06346893310547,"X":-301.8452453613281,"Z":-566.1630859375},
+  {"Y":-53.833702087402344,"X":-305.91009521484375,"Z":-566.3574829101562},
+  {"Y":-49.61913299560547,"X":-312.7228088378906,"Z":-566.7962036132812},
+  {"Y":-48.3958740234375,"X":-316.551025390625,"Z":-566.6005859375},
+  {"Y":-47.83404541015625,"X":-326.1128234863281,"Z":-566.3486328125},
+  {"Y":-47.28473663330078,"X":-336.4104919433594,"Z":-565.8798217773438},
+  {"Y":-47.01621627807617,"X":-346.478759765625,"Z":-565.0870361328125},
+  {"Y":-46.99626159667969,"X":-355.8282470703125,"Z":-563.5328979492188},
+  {"Y":-45.375816345214844,"X":-361.52484130859375,"Z":-562.7321166992188},
+  {"Y":-44.30445861816406,"X":-366.67950439453125,"Z":-561.8820190429688},
+  {"Y":-44.01774597167969,"X":-369.08349609375,"Z":-561.7401733398438},
+  {"Y":-44.986141204833984,"X":-363.77203369140625,"Z":-562.9739379882812},
+  {"Y":-46.64341354370117,"X":-358.5207824707031,"Z":-563.5941772460938},
+  {"Y":-47.000003814697266,"X":-350.8327941894531,"Z":-564.6366577148438},
+  {"Y":-47.1435546875,"X":-342.3503723144531,"Z":-565.2587280273438},
+  {"Y":-47.33792495727539,"X":-331.8656311035156,"Z":-566.7357177734375},
+  {"Y":-48.27005386352539,"X":-322.7013854980469,"Z":-567.354736328125},
+  {"Y":-48.38115692138672,"X":-316.8957824707031,"Z":-567.0587158203125},
+  {"Y":-49.52067947387695,"X":-313.1713562011719,"Z":-566.9126586914062},
+  {"Y":-54.88465881347656,"X":-308.2060852050781,"Z":-568.2576293945312},
+  {"Y":-55.71764373779297,"X":-305.080810546875,"Z":-568.9219970703125},
+  {"Y":-56.15403747558594,"X":-297.9307556152344,"Z":-567.2255249023438},
+  {"Y":-57.020286560058594,"X":-284.7225341796875,"Z":-564.8006591796875},
+  {"Y":-57.21599578857422,"X":-277.8568420410156,"Z":-563.0038452148438},
+  {"Y":-57.80225372314453,"X":-271.36090087890625,"Z":-559.9007568359375},
+  {"Y":-56.77184295654297,"X":-268.2525939941406,"Z":-558.3744506835938},
+  {"Y":-56.460670471191406,"X":-263.7364196777344,"Z":-556.878662109375},
+  {"Y":-55.87192153930664,"X":-260.0214538574219,"Z":-555.170654296875},
+  {"Y":-56.31298065185547,"X":-256.2381286621094,"Z":-553.7573852539062},
+  {"Y":-57.14905548095703,"X":-251.2534637451172,"Z":-551.7664184570312},
+  {"Y":-57.801456451416016,"X":-245.72120666503906,"Z":-549.5245361328125},
+  {"Y":-59.587711334228516,"X":-239.49424743652344,"Z":-546.03564453125},
+  {"Y":-59.07588195800781,"X":-231.01361083984375,"Z":-540.78955078125},
+  {"Y":-59.85810852050781,"X":-223.98020935058594,"Z":-536.6942138671875},
+  {"Y":-59.32429122924805,"X":-218.5274200439453,"Z":-532.5496826171875},
+  {"Y":-59.318973541259766,"X":-214.47142028808594,"Z":-528.6907958984375},
+  {"Y":-59.000003814697266,"X":-205.77403259277344,"Z":-514.8250732421875},
+  {"Y":-59.635501861572266,"X":-201.66891479492188,"Z":-507.802490234375},
+  {"Y":-60.6660270690918,"X":-199.6327362060547,"Z":-503.5239562988281},
+  {"Y":-63.018436431884766,"X":-195.99563598632812,"Z":-496.31402587890625},
+  {"Y":-63.47124481201172,"X":-194.01144409179688,"Z":-490.2722473144531},
+  {"Y":-63.150779724121094,"X":-192.33627319335938,"Z":-484.3065490722656},
+  {"Y":-63.445621490478516,"X":-190.15048217773438,"Z":-480.2445373535156},
+  {"Y":-64.37374114990234,"X":-187.79025268554688,"Z":-475.1167297363281},
+  {"Y":-66.39417266845703,"X":-184.70257568359375,"Z":-470.7013854980469},
+  {"Y":-67.04651641845703,"X":-180.10128784179688,"Z":-464.0059814453125},
+  {"Y":-68.44478607177734,"X":-174.04037475585938,"Z":-459.1343688964844},
+  {"Y":-69.00057220458984,"X":-170.7844696044922,"Z":-458.5052185058594},
+  {"Y":-78.59272003173828,"X":-170.85076904296875,"Z":-456.0074768066406},
+  {"Y":-88.7412109375,"X":-171.70973205566406,"Z":-458.27325439453125},
+  {"Y":-96.18685913085938,"X":-168.58856201171875,"Z":-460.8108215332031},
+  {"Y":-100.5133056640625,"X":-165.9183349609375,"Z":-466.1009826660156},
+  {"Y":-99.71646118164062,"X":-167.10324096679688,"Z":-473.5707092285156},
+  {"Y":-98.81915283203125,"X":-167.1954803466797,"Z":-477.0744934082031},
+  {"Y":-99.6044921875,"X":-165.96986389160156,"Z":-481.63446044921875},
+  {"Y":-99.95574188232422,"X":-162.99380493164062,"Z":-486.5502014160156},
+  {"Y":-98.20748901367188,"X":-162.020751953125,"Z":-491.1322021484375},
+  {"Y":-98.45223236083984,"X":-161.22610473632812,"Z":-494.90814208984375},
+  {"Y":-100.04280853271484,"X":-162.77430725097656,"Z":-499.8187561035156},
+  {"Y":-99.05226135253906,"X":-166.9684295654297,"Z":-502.5689697265625},
+  {"Y":-99.72483825683594,"X":-170.27288818359375,"Z":-504.0333557128906},
+  {"Y":-101.55168151855469,"X":-175.0640869140625,"Z":-504.6931457519531},
+  {"Y":-102.8446044921875,"X":-181.4249267578125,"Z":-504.275146484375},
+  {"Y":-103.38532257080078,"X":-186.8292999267578,"Z":-503.1620788574219},
+  {"Y":-103.61190795898438,"X":-189.79571533203125,"Z":-500.06207275390625},
+  {"Y":-103.22256469726562,"X":-192.6428985595703,"Z":-495.9230651855469},
+  {"Y":-103.20774841308594,"X":-193.46253967285156,"Z":-491.5081787109375},
+  {"Y":-103.00000762939453,"X":-192.6638946533203,"Z":-485.9336242675781},
+  {"Y":-103.1484603881836,"X":-191.2968292236328,"Z":-477.20269775390625},
+  {"Y":-103.46271514892578,"X":-190.2761688232422,"Z":-466.2491760253906},
+  {"Y":-103.60044860839844,"X":-189.6810302734375,"Z":-462.7760314941406},
+  {"Y":-103.08612823486328,"X":-190.93386840820312,"Z":-478.0238342285156},
+  {"Y":-103.29718780517578,"X":-195.1613311767578,"Z":-495.3601379394531},
+  {"Y":-103.84391784667969,"X":-190.9109344482422,"Z":-500.3244934082031},
+  {"Y":-103.26763916015625,"X":-187.01072692871094,"Z":-504.1353454589844},
+  {"Y":-103.00000762939453,"X":-182.21456909179688,"Z":-505.6050109863281},
+  {"Y":-103.42952728271484,"X":-177.06646728515625,"Z":-506.1963806152344},
+  {"Y":-101.2374496459961,"X":-173.15292358398438,"Z":-505.19012451171875},
+  {"Y":-99.37002563476562,"X":-169.67352294921875,"Z":-503.92034912109375},
+  {"Y":-99.18386840820312,"X":-166.0050811767578,"Z":-502.03753662109375},
+  {"Y":-100.1380386352539,"X":-162.4307403564453,"Z":-499.90545654296875},
+  {"Y":-100.0686264038086,"X":-160.14646911621094,"Z":-498.29754638671875},
+  {"Y":-99.83262634277344,"X":-158.645751953125,"Z":-497.6225891113281},
+  {"Y":-102.7552719116211,"X":-155.62728881835938,"Z":-495.708740234375},
+  {"Y":-102.8098373413086,"X":-151.4722137451172,"Z":-492.8936462402344},
+  {"Y":-102.41871643066406,"X":-146.07627868652344,"Z":-490.1046447753906},
+  {"Y":-98.11237335205078,"X":-144.6497802734375,"Z":-490.2248229980469},
+  {"Y":-96.05533599853516,"X":-139.55751037597656,"Z":-489.9093933105469},
+  {"Y":-102.75867462158203,"X":-135.40403747558594,"Z":-490.0671081542969},
+  {"Y":-103.00000762939453,"X":-128.996826171875,"Z":-486.8004150390625},
+  {"Y":-103.00000762939453,"X":-86.85153198242188,"Z":-471.48431396484375},
+  {"Y":-102.83710479736328,"X":-78.46856689453125,"Z":-466.96978759765625},
+  {"Y":-101.96016693115234,"X":-75.67974853515625,"Z":-464.9782409667969},
+  {"Y":-101.52145385742188,"X":-69.9902114868164,"Z":-461.5746765136719},
+  {"Y":-100.27839660644531,"X":-67.62254333496094,"Z":-460.17779541015625},
+  {"Y":-102.2340316772461,"X":-65.15495300292969,"Z":-460.4151306152344},
+  {"Y":-103.00000762939453,"X":-41.906707763671875,"Z":-447.0376892089844},
+  {"Y":-103.00704956054688,"X":-32.967735290527344,"Z":-441.931396484375},
+  {"Y":-103.00000762939453,"X":3.7265403270721436,"Z":-414.25274658203125},
+  {"Y":-100.8818359375,"X":15.071966171264648,"Z":-411.3806457519531},
+  {"Y":-99.89068603515625,"X":16.625764846801758,"Z":-407.8677062988281},
+  {"Y":-99.21542358398438,"X":17.921348571777344,"Z":-403.77264404296875},
+  {"Y":-98.65266418457031,"X":22.046314239501953,"Z":-391.6380310058594},
+  {"Y":-99.00000762939453,"X":25.051910400390625,"Z":-385.7096862792969},
+  {"Y":-99.51049041748047,"X":29.444536209106445,"Z":-378.48150634765625},
+  {"Y":-99.09060668945312,"X":35.02845764160156,"Z":-373.4461975097656},
+  {"Y":-99.00000762939453,"X":41.340599060058594,"Z":-369.12310791015625},
+  {"Y":-99.00000762939453,"X":44.15993118286133,"Z":-367.4710693359375},
+  {"Y":-99.05789947509766,"X":38.43994140625,"Z":-371.1219177246094},
+  {"Y":-99.01305389404297,"X":33.63816452026367,"Z":-375.5933837890625},
+  {"Y":-99.69683074951172,"X":28.073333740234375,"Z":-381.40234375},
+  {"Y":-98.99775695800781,"X":24.011993408203125,"Z":-386.8166198730469},
+  {"Y":-98.53417205810547,"X":22.334383010864258,"Z":-391.8175964355469},
+  {"Y":-99.00000762939453,"X":20.765003204345703,"Z":-397.4351806640625},
+  {"Y":-99.18146514892578,"X":18.369617462158203,"Z":-403.4071044921875},
+  {"Y":-100.1969223022461,"X":15.530204772949219,"Z":-408.36822509765625},
+  {"Y":-102.43180847167969,"X":12.02324104309082,"Z":-412.1971435546875},
+  {"Y":-103.00000762939453,"X":2.9556632041931152,"Z":-410.4751281738281},
+  {"Y":-103.00000762939453,"X":-8.490689277648926,"Z":-407.6667175292969},
+  {"Y":-103.00000762939453,"X":-34.45203399658203,"Z":-395.26318359375},
+  {"Y":-103.252685546875,"X":-41.77769088745117,"Z":-392.8024597167969},
+  {"Y":-104.76951599121094,"X":-45.72745895385742,"Z":-389.7296142578125},
+  {"Y":-107.13170623779297,"X":-48.52360153198242,"Z":-385.35284423828125},
+  {"Y":-107.39091491699219,"X":-49.988243103027344,"Z":-378.5714111328125},
+  {"Y":-106.99885559082031,"X":-48.9948844909668,"Z":-374.84228515625},
+  {"Y":-101.33196258544922,"X":-47.123111724853516,"Z":-371.840087890625},
+  {"Y":-94.51768493652344,"X":-45.06036376953125,"Z":-370.23309326171875},
+  {"Y":-93.10615539550781,"X":-43.68492126464844,"Z":-369.8830261230469},
+  {"Y":-91.43245697021484,"X":-40.858848571777344,"Z":-367.45867919921875},
+  {"Y":-91.60712432861328,"X":-33.056732177734375,"Z":-362.6321105957031},
+  {"Y":-91.00153350830078,"X":12.012492179870605,"Z":-337.3138427734375},
+  {"Y":-87.85481262207031,"X":20.849050521850586,"Z":-333.2263488769531},
+  {"Y":-86.75531768798828,"X":24.74131202697754,"Z":-331.86138916015625},
+  {"Y":-84.49986267089844,"X":29.52347755432129,"Z":-330.1281433105469},
+  {"Y":-83.82085418701172,"X":35.02643585205078,"Z":-328.8303527832031},
+  {"Y":-85.12468719482422,"X":44.25493240356445,"Z":-325.2322082519531},
+  {"Y":-85.48255157470703,"X":52.482574462890625,"Z":-322.9123229980469},
+  {"Y":-85.11820983886719,"X":60.28593063354492,"Z":-323.2423400878906},
+  {"Y":-87.45380401611328,"X":74.68778228759766,"Z":-323.9905700683594},
+  {"Y":-88.29585266113281,"X":88.11256408691406,"Z":-325.3638000488281},
+  {"Y":-88.72117614746094,"X":101.85709381103516,"Z":-326.2945556640625},
+  {"Y":-90.98450469970703,"X":116.00377655029297,"Z":-327.4949951171875},
+  {"Y":-91.06583404541016,"X":128.3017578125,"Z":-328.7770690917969},
+  {"Y":-91.06879425048828,"X":141.6127471923828,"Z":-335.6646423339844},
+  {"Y":-91.27796173095703,"X":149.55735778808594,"Z":-338.4092102050781},
+  {"Y":-91.55013275146484,"X":160.45973205566406,"Z":-341.1788330078125},
+  {"Y":-91.98895263671875,"X":172.7015380859375,"Z":-346.0210266113281},
+  {"Y":-91.54741668701172,"X":175.3884735107422,"Z":-347.12164306640625},
+  {"Y":-91.1111831665039,"X":181.11997985839844,"Z":-349.6989440917969},
+  {"Y":-87.95037078857422,"X":190.6151123046875,"Z":-355.0612487792969},
+  {"Y":-87.08727264404297,"X":198.41522216796875,"Z":-359.5683288574219},
+  {"Y":-86.61406707763672,"X":207.2825927734375,"Z":-363.96490478515625},
+  {"Y":-83.54988098144531,"X":213.35821533203125,"Z":-367.4212341308594},
+  {"Y":-82.61236572265625,"X":219.66802978515625,"Z":-370.9901123046875},
+  {"Y":-80.18965911865234,"X":225.8492889404297,"Z":-374.7739562988281},
+  {"Y":-77.98857879638672,"X":228.83462524414062,"Z":-376.8498840332031},
+  {"Y":-76.35271453857422,"X":232.80177307128906,"Z":-379.5791015625},
+  {"Y":-75.41687774658203,"X":238.99673461914062,"Z":-383.802001953125},
+  {"Y":-75.36737060546875,"X":244.98672485351562,"Z":-388.02484130859375},
+  {"Y":-72.5152587890625,"X":249.4670867919922,"Z":-390.2270812988281},
+  {"Y":-71.29468536376953,"X":255.10031127929688,"Z":-392.75146484375},
+  {"Y":-71.44283294677734,"X":267.40325927734375,"Z":-399.1216735839844},
+  {"Y":-71.58580780029297,"X":274.3494567871094,"Z":-401.6815185546875},
+  {"Y":-71.31790924072266,"X":283.3896179199219,"Z":-406.6034240722656},
+  {"Y":-71.66345977783203,"X":293.1257019042969,"Z":-412.34912109375},
+  {"Y":-71.61150360107422,"X":301.6584777832031,"Z":-416.8661193847656},
+  {"Y":-73.13687896728516,"X":317.30029296875,"Z":-425.4315490722656},
+  {"Y":-71.248046875,"X":323.3909606933594,"Z":-429.2738952636719},
+  {"Y":-71.0307388305664,"X":328.58721923828125,"Z":-432.66766357421875},
+  {"Y":-70.9549560546875,"X":332.32196044921875,"Z":-436.5557556152344},
+  {"Y":-71.00000762939453,"X":338.4581604003906,"Z":-443.42138671875},
+  {"Y":-71.33671569824219,"X":344.9645690917969,"Z":-453.1653137207031},
+  {"Y":-71.43818664550781,"X":352.7499084472656,"Z":-464.8789978027344},
+  {"Y":-70.8949203491211,"X":359.81854248046875,"Z":-476.35809326171875},
+  {"Y":-68.60955810546875,"X":364.3243103027344,"Z":-484.84686279296875},
+  {"Y":-67.56380462646484,"X":371.3843078613281,"Z":-493.7884826660156},
+  {"Y":-66.02519226074219,"X":376.271728515625,"Z":-501.3860778808594},
+  {"Y":-65.52554321289062,"X":381.2374267578125,"Z":-509.5525207519531},
+  {"Y":-63.46936798095703,"X":387.53961181640625,"Z":-518.5033569335938},
+  {"Y":-63.69522476196289,"X":392.78582763671875,"Z":-525.2867431640625},
+  {"Y":-64.39662170410156,"X":398.08367919921875,"Z":-532.3944091796875},
+  {"Y":-63.50368118286133,"X":403.20697021484375,"Z":-539.463623046875},
+  {"Y":-63.14091491699219,"X":407.6586608886719,"Z":-545.7115478515625},
+  {"Y":-63.140628814697266,"X":413.173828125,"Z":-553.541259765625},
+  {"Y":-62.45137023925781,"X":418.0688171386719,"Z":-560.4927978515625},
+  {"Y":-60.04181671142578,"X":423.03704833984375,"Z":-567.4292602539062},
+  {"Y":-59.2119026184082,"X":426.392822265625,"Z":-570.9852294921875},
+  {"Y":-58.391910552978516,"X":431.39501953125,"Z":-574.562255859375},
+  {"Y":-58.5391960144043,"X":438.1629333496094,"Z":-579.6292724609375},
+  {"Y":-55.799312591552734,"X":441.9357604980469,"Z":-583.5121459960938},
+  {"Y":-54.70676040649414,"X":445.908203125,"Z":-589.20556640625},
+  {"Y":-54.504154205322266,"X":449.6161193847656,"Z":-596.202392578125},
+  {"Y":-53.392913818359375,"X":450.5801696777344,"Z":-601.468017578125},
+  {"Y":-53.71951675415039,"X":451.4999694824219,"Z":-613.6271362304688},
+  {"Y":-51.726993560791016,"X":452.08380126953125,"Z":-634.3920288085938},
+  {"Y":-52.33588409423828,"X":451.81268310546875,"Z":-642.1153564453125},
+  {"Y":-51.66029739379883,"X":452.8863830566406,"Z":-651.91796875},
+  {"Y":-51.43056106567383,"X":454.2159729003906,"Z":-659.6134643554688},
+  {"Y":-53.138755798339844,"X":465.1197814941406,"Z":-671.15234375},
+  {"Y":-52.21376419067383,"X":471.9156494140625,"Z":-676.2056884765625},
+  {"Y":-51.88432312011719,"X":476.91363525390625,"Z":-682.4304809570312},
+  {"Y":-51.47580337524414,"X":480.2375793457031,"Z":-688.4600830078125},
+  {"Y":-50.84123992919922,"X":485.443603515625,"Z":-696.1939086914062},
+  {"Y":-47.667659759521484,"X":489.8533020019531,"Z":-703.0410766601562},
+  {"Y":-44.84425354003906,"X":494.1472473144531,"Z":-708.5020751953125},
+  {"Y":-42.40242004394531,"X":500.21405029296875,"Z":-715.4789428710938},
+  {"Y":-39.907142639160156,"X":504.26312255859375,"Z":-720.9984741210938},
+  {"Y":-37.426292419433594,"X":511.5397033691406,"Z":-723.7406005859375},
+  {"Y":-34.88694763183594,"X":517.7926025390625,"Z":-722.4945678710938},
+  {"Y":-35.786346435546875,"X":525.240478515625,"Z":-722.4901123046875},
+  {"Y":-35.09760284423828,"X":533.0051879882812,"Z":-721.6177978515625},
+  {"Y":-34.776100158691406,"X":539.272705078125,"Z":-719.8760375976562},
+  {"Y":-35.01211929321289,"X":546.516357421875,"Z":-723.972900390625},
+  {"Y":-35.24473571777344,"X":555.3798828125,"Z":-739.08642578125},
+  {"Y":-35.713584899902344,"X":558.068603515625,"Z":-745.2341918945312},
+  {"Y":-35.27496337890625,"X":557.7745971679688,"Z":-752.2593383789062},
+  {"Y":-35.20258331298828,"X":554.815673828125,"Z":-755.6443481445312},
+  {"Y":-35.203914642333984,"X":545.1451416015625,"Z":-760.0690307617188},
+  {"Y":-33.5947151184082,"X":529.8575439453125,"Z":-762.5135498046875},
+  {"Y":-32.19371795654297,"X":526.4688720703125,"Z":-763.1781616210938},
+  {"Y":-31.417224884033203,"X":520.8681030273438,"Z":-764.229736328125},
+  {"Y":-35.04903793334961,"X":515.293701171875,"Z":-766.5718383789062},
+  {"Y":-34.771366119384766,"X":509.0710754394531,"Z":-767.3905029296875},
+  {"Y":-34.33096694946289,"X":501.6406555175781,"Z":-767.68701171875},
+  {"Y":-32.045658111572266,"X":484.2459716796875,"Z":-769.2265014648438},
+  {"Y":-30.864042282104492,"X":478.3973693847656,"Z":-772.3704223632812},
+  {"Y":-31.622493743896484,"X":470.46392822265625,"Z":-773.4134521484375},
+  {"Y":-26.51738739013672,"X":465.7380065917969,"Z":-774.5406494140625},
+  {"Y":-23.058670043945312,"X":460.8208923339844,"Z":-779.2946166992188},
+  {"Y":-22.18145179748535,"X":456.3913269042969,"Z":-780.4681396484375},
+  {"Y":-14.820878982543945,"X":458.2960510253906,"Z":-780.1739501953125},
+  {"Y":-10.045060157775879,"X":455.3318176269531,"Z":-779.896240234375},
+  {"Y":-5.0641679763793945,"X":457.1982421875,"Z":-785.5106201171875},
+  {"Y":-3.17092227935791,"X":460.05169677734375,"Z":-790.1520385742188},
+  {"Y":0.6992558240890503,"X":461.722412109375,"Z":-792.2465209960938},
+  {"Y":-3.000000238418579,"X":470.4469909667969,"Z":-805.1152954101562},
+  {"Y":-3.030179977416992,"X":480.0909729003906,"Z":-820.167724609375},
+  {"Y":-5.368036270141602,"X":485.5069885253906,"Z":-827.7872314453125},
+  {"Y":-10.285971641540527,"X":492.91497802734375,"Z":-839.5818481445312},
+  {"Y":-11.141221046447754,"X":513.2621459960938,"Z":-864.178955078125},
+  {"Y":-10.747920989990234,"X":524.4169921875,"Z":-877.8460083007812},
+  {"Y":-11.404980659484863,"X":537.26123046875,"Z":-893.1806030273438},
+  {"Y":-11.141646385192871,"X":552.4453735351562,"Z":-912.08837890625},
+  {"Y":-12.008888244628906,"X":565.8240966796875,"Z":-928.4005126953125},
+  {"Y":-11.304689407348633,"X":579.6270141601562,"Z":-944.4994506835938},
+  {"Y":-11.63168716430664,"X":597.220458984375,"Z":-964.9895629882812},
+  {"Y":-11.002983093261719,"X":613.4839477539062,"Z":-984.36376953125},
+  {"Y":-11.692530632019043,"X":628.6997680664062,"Z":-1003.751953125},
+  {"Y":-11.272380828857422,"X":657.9814453125,"Z":-1043.348876953125},
+  {"Y":-11.102283477783203,"X":674.0638427734375,"Z":-1065.55126953125},
+  {"Y":-10.767114639282227,"X":695.3516845703125,"Z":-1094.435302734375},
+  {"Y":-11.811549186706543,"X":708.2864379882812,"Z":-1112.4573974609375},
+  {"Y":-11.129387855529785,"X":723.0054931640625,"Z":-1131.6226806640625},
+  {"Y":-11.931636810302734,"X":740.6757202148438,"Z":-1156.9210205078125},
+  {"Y":-11.4698486328125,"X":755.2365112304688,"Z":-1176.3807373046875},
+  {"Y":-11.221674919128418,"X":771.8770751953125,"Z":-1198.9136962890625},
+  {"Y":-11.22555923461914,"X":787.12939453125,"Z":-1219.23876953125},
+  {"Y":-11.00002670288086,"X":799.8909301757812,"Z":-1236.0626220703125},
+  {"Y":-8.07883071899414,"X":811.117919921875,"Z":-1250.85107421875},
+  {"Y":-7.010777950286865,"X":820.9105224609375,"Z":-1263.68017578125},
+  {"Y":-7.0001325607299805,"X":834.0552978515625,"Z":-1280.9017333984375},
+  {"Y":-7.001230716705322,"X":845.7407836914062,"Z":-1297.474609375},
+  {"Y":-6.0939621925354,"X":863.5108642578125,"Z":-1323.879638671875},
+  {"Y":-3.5840694904327393,"X":873.650390625,"Z":-1339.087158203125},
+  {"Y":-3.000000238418579,"X":883.4424438476562,"Z":-1353.365478515625},
+  {"Y":-3.000000238418579,"X":903.984375,"Z":-1388.2513427734375},
+  {"Y":-1.805720567703247,"X":915.2468872070312,"Z":-1430.1007080078125},
+  {"Y":-2.728649854660034,"X":950.0048828125,"Z":-1431.7740478515625},
+  {"Y":-2.9486732482910156,"X":968.576904296875,"Z":-1407.77587890625},
+  {"Y":-3.000000238418579,"X":957.7310791015625,"Z":-1378.613037109375},
+  {"Y":-3.0774500370025635,"X":939.2338256835938,"Z":-1327.06884765625},
+  {"Y":-4.949947834014893,"X":934.7735595703125,"Z":-1315.2174072265625},
+  {"Y":-5.282273292541504,"X":931.3568725585938,"Z":-1307.1546630859375},
+  {"Y":-7.695448875427246,"X":898.2717895507812,"Z":-1226.6763916015625},
+  {"Y":-11.003393173217773,"X":831.3695678710938,"Z":-1011.8756713867188},
+  {"Y":-11.056432723999023,"X":817.0744018554688,"Z":-965.164794921875},
+  {"Y":-11.275833129882812,"X":798.0322875976562,"Z":-900.73388671875},
+  {"Y":-11.161184310913086,"X":788.054931640625,"Z":-866.954833984375},
+  {"Y":-11.462051391601562,"X":777.7346801757812,"Z":-829.2992553710938},
+  {"Y":-11.12103271484375,"X":773.3329467773438,"Z":-812.5872802734375},
+  {"Y":-10.258313179016113,"X":768.0633544921875,"Z":-791.3644409179688},
+  {"Y":-6.628530025482178,"X":763.0335083007812,"Z":-773.1318969726562},
+  {"Y":-3.550117015838623,"X":760.0989379882812,"Z":-761.4808349609375},
+  {"Y":-3.000000238418579,"X":743.0086059570312,"Z":-724.6702270507812},
+  {"Y":-3.0162200927734375,"X":694.4647827148438,"Z":-652.630126953125},
+  {"Y":-3.000000238418579,"X":682.6077880859375,"Z":-636.3604125976562},
+  {"Y":-3.000000238418579,"X":677.5992431640625,"Z":-629.8463745117188},
+  {"Y":-3.305405855178833,"X":662.3897094726562,"Z":-603.7764282226562},
+  {"Y":-6.77603006362915,"X":657.8972778320312,"Z":-595.91796875},
+  {"Y":-8.475486755371094,"X":653.0084838867188,"Z":-588.3338012695312},
+  {"Y":-10.240747451782227,"X":649.1417846679688,"Z":-577.76611328125},
+  {"Y":-8.376097679138184,"X":642.802490234375,"Z":-565.6820068359375},
+  {"Y":-6.025497913360596,"X":634.5487060546875,"Z":-548.2522583007812},
+  {"Y":-1.7862539291381836,"X":629.5249633789062,"Z":-539.073486328125},
+  {"Y":0.6893512010574341,"X":628.2838134765625,"Z":-533.9857177734375},
+  {"Y":5.748163223266602,"X":626.4796752929688,"Z":-529.591796875},
+  {"Y":8.201542854309082,"X":624.6881103515625,"Z":-524.04736328125},
+  {"Y":11.110108375549316,"X":623.561279296875,"Z":-520.6100463867188},
+  {"Y":14.130831718444824,"X":623.3159790039062,"Z":-513.29833984375},
+  {"Y":18.671472549438477,"X":623.6087646484375,"Z":-507.65716552734375},
+  {"Y":21.940242767333984,"X":623.5772705078125,"Z":-500.0639953613281},
+  {"Y":24.366683959960938,"X":624.3175048828125,"Z":-495.27056884765625},
+  {"Y":28.475650787353516,"X":624.5889282226562,"Z":-486.86798095703125},
+  {"Y":32.14634704589844,"X":625.310791015625,"Z":-478.8609619140625},
+  {"Y":34.517581939697266,"X":624.6640625,"Z":-470.4275817871094},
+  {"Y":38.095458984375,"X":624.8303833007812,"Z":-460.66595458984375},
+  {"Y":40.796791076660156,"X":624.9420166015625,"Z":-450.5560607910156},
+  {"Y":43.939903259277344,"X":624.7047119140625,"Z":-442.2525329589844},
+  {"Y":49.02988815307617,"X":627.56201171875,"Z":-437.8931579589844},
+  {"Y":51.77692413330078,"X":630.420654296875,"Z":-435.1104736328125},
+  {"Y":51.90930938720703,"X":634.3554077148438,"Z":-431.2475891113281},
+  {"Y":52.366153717041016,"X":641.0646362304688,"Z":-424.90142822265625},
+  {"Y":56.53355026245117,"X":645.445068359375,"Z":-421.09808349609375},
+  {"Y":62.04644012451172,"X":649.8132934570312,"Z":-417.91766357421875},
+  {"Y":68.08789825439453,"X":654.2450561523438,"Z":-414.143798828125},
+  {"Y":73.24687957763672,"X":656.8256225585938,"Z":-412.3144226074219},
+  {"Y":78.90837860107422,"X":662.0067138671875,"Z":-408.18597412109375},
+  {"Y":82.98204803466797,"X":667.2230834960938,"Z":-402.8453369140625},
+  {"Y":81.59259796142578,"X":669.4986572265625,"Z":-398.0979919433594},
+  {"Y":79.89143371582031,"X":672.2779541015625,"Z":-389.16632080078125},
+  {"Y":78.60698699951172,"X":668.2279052734375,"Z":-385.82470703125},
+  {"Y":75.25519561767578,"X":665.3071899414062,"Z":-382.8462219238281},
+  {"Y":69.9371566772461,"X":659.3328247070312,"Z":-380.6140441894531},
+  {"Y":67.1477279663086,"X":658.0086669921875,"Z":-379.0574951171875},
+  {"Y":61.42045974731445,"X":656.0389404296875,"Z":-376.83428955078125},
+  {"Y":52.50547409057617,"X":651.2752685546875,"Z":-373.37554931640625},
+  {"Y":52.408809661865234,"X":630.9236450195312,"Z":-374.9997253417969},
+  {"Y":53.091304779052734,"X":614.1466064453125,"Z":-379.9891662597656},
+  {"Y":51.134803771972656,"X":606.0718383789062,"Z":-382.7008056640625},
+  {"Y":47.737369537353516,"X":600.2044067382812,"Z":-383.49114990234375},
+  {"Y":45.21513366699219,"X":595.276123046875,"Z":-383.8108825683594},
+  {"Y":40.619834899902344,"X":592.3655395507812,"Z":-382.5093688964844},
+  {"Y":38.13515853881836,"X":589.0232543945312,"Z":-383.8357849121094},
+  {"Y":32.977046966552734,"X":586.8980102539062,"Z":-386.8141784667969},
+  {"Y":21.155057907104492,"X":588.70849609375,"Z":-390.8285827636719},
+  {"Y":-2.654977321624756,"X":588.0673217773438,"Z":-381.6949157714844},
+  {"Y":-7.684947967529297,"X":626.2705688476562,"Z":-379.62481689453125},
+  {"Y":-7.4480977058410645,"X":626.1171875,"Z":-363.8872985839844},
+  {"Y":-7.127583980560303,"X":599.4073486328125,"Z":-354.0350646972656},
+  {"Y":-4.210725784301758,"X":593.4910888671875,"Z":-351.307373046875},
+  {"Y":4.7147650718688965,"X":591.4130249023438,"Z":-353.0568542480469},
+  {"Y":6.0018415451049805,"X":591.3334350585938,"Z":-348.1437683105469},
+  {"Y":13.21908950805664,"X":589.8634033203125,"Z":-348.3128356933594},
+  {"Y":14.621463775634766,"X":586.0955810546875,"Z":-344.2323303222656},
+  {"Y":22.235395431518555,"X":585.5548095703125,"Z":-336.2389221191406},
+  {"Y":29.133586883544922,"X":589.7534790039062,"Z":-334.7248840332031},
+  {"Y":32.41560745239258,"X":594.5608520507812,"Z":-329.6348571777344},
+  {"Y":36.17361068725586,"X":599.4071044921875,"Z":-323.5225830078125},
+  {"Y":37.34553527832031,"X":603.885009765625,"Z":-317.0884704589844},
+  {"Y":38.22057342529297,"X":609.7008666992188,"Z":-309.5472412109375},
+  {"Y":39.61412048339844,"X":619.677734375,"Z":-308.6263122558594},
+  {"Y":39.185874938964844,"X":627.0267333984375,"Z":-302.7242126464844},
+  {"Y":37.633995056152344,"X":631.135009765625,"Z":-293.875},
+  {"Y":41.56911849975586,"X":635.5157470703125,"Z":-287.10394287109375},
+  {"Y":44.98186492919922,"X":637.4453125,"Z":-280.6021728515625},
+  {"Y":48.226463317871094,"X":640.50830078125,"Z":-272.7751770019531},
+  {"Y":49.14834213256836,"X":638.5109252929688,"Z":-264.9157409667969},
+  {"Y":55.298587799072266,"X":633.8101196289062,"Z":-254.40452575683594},
+  {"Y":57.48206329345703,"X":631.0281982421875,"Z":-248.45314025878906},
+  {"Y":59.46984100341797,"X":629.8718872070312,"Z":-241.9771270751953},
+  {"Y":59.10336685180664,"X":629.2981567382812,"Z":-236.8556365966797},
+  {"Y":60.045406341552734,"X":629.8081665039062,"Z":-229.0498809814453},
+  {"Y":57.956520080566406,"X":629.240966796875,"Z":-222.67181396484375},
+  {"Y":55.02715301513672,"X":630.6521606445312,"Z":-216.2028045654297},
+  {"Y":55.70802307128906,"X":633.6024780273438,"Z":-210.08348083496094},
+  {"Y":55.84886169433594,"X":640.5601806640625,"Z":-205.1851043701172},
+  {"Y":57.21739959716797,"X":645.3031616210938,"Z":-202.9598846435547},
+  {"Y":57.01459503173828,"X":650.5020141601562,"Z":-201.03211975097656},
+  {"Y":54.441917419433594,"X":652.9423828125,"Z":-197.86856079101562},
+  {"Y":52.41732406616211,"X":655.8328247070312,"Z":-195.1513671875},
+  {"Y":48.3479118347168,"X":657.3773803710938,"Z":-193.0382843017578},
+  {"Y":47.34374237060547,"X":658.980712890625,"Z":-191.66871643066406},
+  {"Y":41.47685623168945,"X":659.1843872070312,"Z":-190.9698944091797},
+  {"Y":32.493106842041016,"X":660.2807006835938,"Z":-189.69837951660156},
+  {"Y":31.84274673461914,"X":659.7451171875,"Z":-180.9114990234375},
+  {"Y":31.443052291870117,"X":659.1201782226562,"Z":-172.5311737060547},
+  {"Y":28.084840774536133,"X":658.114990234375,"Z":-165.79910278320312},
+  {"Y":24.989084243774414,"X":658.1983642578125,"Z":-162.21621704101562},
+  {"Y":19.10715103149414,"X":657.2141723632812,"Z":-160.3463592529297},
+  {"Y":12.222146034240723,"X":656.5146484375,"Z":-156.4554901123047},
+  {"Y":7.353592872619629,"X":655.711181640625,"Z":-151.46495056152344},
+  {"Y":2.671508550643921,"X":655.4637451171875,"Z":-146.81991577148438},
+  {"Y":-3.66068959236145,"X":655.377197265625,"Z":-139.4569549560547},
+  {"Y":-3.001863718032837,"X":656.1939086914062,"Z":-130.7874755859375},
+  {"Y":-4.399129867553711,"X":657.0941162109375,"Z":-121.9315414428711},
+  {"Y":-8.273381233215332,"X":657.982666015625,"Z":-113.5490493774414},
+  {"Y":-11.015195846557617,"X":627.111572265625,"Z":132.37071228027344},
+  {"Y":-11.261136054992676,"X":609.791748046875,"Z":263.59271240234375},
+  {"Y":-8.885579109191895,"X":609.5862426757812,"Z":267.20001220703125},
+  {"Y":-7.859070777893066,"X":608.17529296875,"Z":272.2980651855469},
+  {"Y":-4.2984795570373535,"X":606.0760498046875,"Z":280.3028869628906},
+  {"Y":-3.569650411605835,"X":602.8991088867188,"Z":293.6758117675781},
+  {"Y":4.513004302978516,"X":600.0526733398438,"Z":303.10076904296875},
+  {"Y":10.150517463684082,"X":599.326416015625,"Z":305.887939453125},
+  {"Y":12.984589576721191,"X":597.525390625,"Z":310.5730285644531},
+  {"Y":12.223811149597168,"X":596.57958984375,"Z":320.5663757324219},
+  {"Y":13.66270637512207,"X":595.28369140625,"Z":327.6494445800781},
+  {"Y":15.206621170043945,"X":594.4208374023438,"Z":338.7000732421875},
+  {"Y":16.844697952270508,"X":593.7723999023438,"Z":343.2518310546875},
+  {"Y":16.258331298828125,"X":593.1474609375,"Z":350.281982421875},
+  {"Y":16.2478084564209,"X":592.0800170898438,"Z":357.35394287109375},
+  {"Y":14.113003730773926,"X":591.1690063476562,"Z":369.71044921875},
+  {"Y":12.318377494812012,"X":590.0687866210938,"Z":377.34234619140625},
+  {"Y":12.15611743927002,"X":589.71435546875,"Z":384.164794921875},
+  {"Y":11.805913925170898,"X":588.4774169921875,"Z":393.35064697265625},
+  {"Y":11.852266311645508,"X":579.8826293945312,"Z":397.20843505859375},
+  {"Y":11.35152530670166,"X":572.998291015625,"Z":396.6087951660156},
+  {"Y":7.906956672668457,"X":567.0726318359375,"Z":395.2830810546875},
+  {"Y":5.366212368011475,"X":564.5574340820312,"Z":394.982666015625},
+  {"Y":4.5040178298950195,"X":563.1307373046875,"Z":393.95660400390625},
+  {"Y":0.68592369556427,"X":562.3555297851562,"Z":393.6614074707031},
+  {"Y":-3.000000476837158,"X":557.0120849609375,"Z":392.62322998046875},
+  {"Y":-3.3503262996673584,"X":466.2137756347656,"Z":335.6769104003906},
+  {"Y":-5.709301471710205,"X":459.9606018066406,"Z":331.15557861328125},
+  {"Y":-7.1692728996276855,"X":452.912353515625,"Z":325.5586242675781},
+  {"Y":-11.154190063476562,"X":444.7742614746094,"Z":319.1195068359375},
+  {"Y":-11.09679126739502,"X":431.4236145019531,"Z":308.0597839355469},
+  {"Y":-11.850899696350098,"X":355.442138671875,"Z":242.17547607421875},
+  {"Y":-11.206036567687988,"X":242.15707397460938,"Z":145.11749267578125},
+  {"Y":-10.102027893066406,"X":233.57847595214844,"Z":139.0832061767578},
+  {"Y":-7.379958152770996,"X":227.58407592773438,"Z":133.75682067871094},
+  {"Y":-4.993008136749268,"X":221.8283233642578,"Z":129.26502990722656},
+  {"Y":-3.156697988510132,"X":216.07904052734375,"Z":123.65445709228516},
+  {"Y":-3.000000238418579,"X":122.92215728759766,"Z":62.1494255065918},
+  {"Y":-3.000000238418579,"X":114.08106994628906,"Z":57.11045837402344},
+  {"Y":-3.000000238418579,"X":102.61692810058594,"Z":52.13056564331055},
+  {"Y":-3.000000238418579,"X":91.96932220458984,"Z":47.055320739746094},
+  {"Y":-3.922480344772339,"X":84.23670196533203,"Z":42.97050476074219},
+  {"Y":-7.297549247741699,"X":77.33952331542969,"Z":39.0709342956543},
+  {"Y":-7.359339714050293,"X":70.72769165039062,"Z":35.33403778076172},
+  {"Y":-7.548770904541016,"X":62.28034210205078,"Z":30.67314910888672},
+  {"Y":-4.252251148223877,"X":55.44533157348633,"Z":27.477188110351562},
+  {"Y":-3.000000238418579,"X":45.26575469970703,"Z":22.478870391845703},
+  {"Y":-3.000000238418579,"X":35.68364334106445,"Z":18.31350326538086},
+  {"Y":-3.000000238418579,"X":25.3939151763916,"Z":14.820062637329102},
+  {"Y":-3.000000238418579,"X":15.17514705657959,"Z":11.12509536743164},
+  {"Y":-3.000000238418579,"X":6.140575408935547,"Z":7.687087535858154},
+  {"Y":-3.000000238418579,"X":-4.953854084014893,"Z":4.090693950653076},
+  {"Y":-3.000000238418579,"X":-13.874646186828613,"Z":2.207000970840454},
+  {"Y":-2.122081995010376,"X":-22.735958099365234,"Z":0.03000379540026188},
+  {"Y":-1.7298052310943604,"X":-29.654523849487305,"Z":-2.045607089996338},
+  {"Y":-4.8891191482543945,"X":-34.940025329589844,"Z":-3.7712810039520264},
+  {"Y":-5.264278411865234,"X":-35.510555267333984,"Z":-3.957075595855713},
+  {"Y":-8.225868225097656,"X":-40.052490234375,"Z":-7.571450710296631},
+  {"Y":-12.569127082824707,"X":-37.999305725097656,"Z":-13.395605087280273},
+  {"Y":-17.933578491210938,"X":-32.109413146972656,"Z":-21.22627830505371},
+  {"Y":-20.773052215576172,"X":-28.30586814880371,"Z":-28.90558433532715},
+  {"Y":-23.67477798461914,"X":-25.395116806030273,"Z":-37.545440673828125},
+  {"Y":-27.3714599609375,"X":-22.878646850585938,"Z":-45.39448928833008},
+  {"Y":-30.781057357788086,"X":-21.680158615112305,"Z":-52.233707427978516},
+  {"Y":-33.658424377441406,"X":-20.34014320373535,"Z":-59.79917526245117}
+]}
+]==]
+    local okR, dataR = pcall(function() return httpservice:JSONDecode(EMBEDDED_ROUTE) end)
+    if okR and type(dataR) == "table" and type(dataR.positions) == "table" and #dataR.positions > 0 then
+        Settings.recordedPositions = dataR.positions
+        currentWaypoint = 1
+        if updateVisualNodes then updateVisualNodes() end
+        Settings.needsDropdownUpdate = true
+    else
+        warn("[Toby] No se pudo cargar la ruta embebida")
     end
+end
 
-ASTER.Tabs.Automation:AddLabel("Respawn")
-Settings.AutoRespawnEnabled = true
-ASTER.Tabs.Automation:AddToggle("Auto Bed Respawn", true, function(v)
-    Settings.AutoRespawnEnabled = v
-    if v then startAutoRespawn() end
+
+
+end
+local okW, errW = pcall(loadWaypoints)
+if not okW then
+    warn("[Hub] Waypoints: " .. tostring(errW))
+    TabWaypoints:AddLabel("Error: " .. tostring(errW))
+end
+
+
+--========================================================================
+-- PESTAÑA 2: BOO LITE (BooLite.lua, sin su menú)
+--========================================================================
+local function loadBoo()
+
+--[[
+ Versión completa (sin la UI library) de las 7 funciones:
+ Pickup, Tp item chest, Mine aura, Auto eat, Auto plant/harvest, Auto craft, Auto campfire, Item deletion.
+
+ - Todas las variables están definidas acá (servicios, módulos del juego, tablas de estado).
+ - Los "library.flags.X" pasaron a una tabla simple: Boo.flags.X
+ - Se controla con:   Boo.set("autopickup", true)    Boo.set("autopickup", false)
+ - Selección de cofre: Boo.set("choosechest", true) y después click en un Chest / Reinforced Chest.
+ - Auto craft:         Boo.flags.autocraftobject = "Steel"; Boo.set("autocraft", true)
+ - Apagar todo:        Boo.unload()
+]]
+
+if getgenv().BooLite then getgenv().BooLite.unload() end
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+------------------------------------------------------------
+-- SERVICIOS
+------------------------------------------------------------
+local ReplicatedStorage   = cloneref(game:GetService("ReplicatedStorage"))
+local Players             = cloneref(game:GetService("Players"))
+local Workspace           = cloneref(game:GetService("Workspace"))
+local CollectionService   = cloneref(game:GetService("CollectionService"))
+local UserInputService    = cloneref(game:GetService("UserInputService"))
+local RunService          = cloneref(game:GetService("RunService"))
+local Stats               = cloneref(game:GetService("Stats"))
+local StarterGui          = cloneref(game:GetService("StarterGui"))
+
+repeat task.wait() until ReplicatedStorage:FindFirstChild("GameLoaded")
+
+------------------------------------------------------------
+-- JUGADOR / PERSONAJE
+------------------------------------------------------------
+local localPlayer = Players.LocalPlayer
+local mouse = localPlayer:GetMouse()
+local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+
+------------------------------------------------------------
+-- MÓDULOS DEL JUEGO
+------------------------------------------------------------
+local game_ = ReplicatedStorage:FindFirstChild("Game")
+local Packets      = require(ReplicatedStorage.Modules.Packets)
+local GameUtil     = require(ReplicatedStorage.Modules.GameUtil)
+local ItemIDS      = require(ReplicatedStorage.Modules.ItemIDS)
+local ItemData     = require(ReplicatedStorage.Modules.ItemData)
+local Clock        = require(ReplicatedStorage.Modules.Clock)
+local animations   = require(game_.animations)
+local inventory    = require(game_.inventory)
+local functions    = require(game_.functions)
+local rendering    = require(game_.rendering)
+local statusEffects = require(game_.classes.statusEffects)
+local interpolationBuffer = rendering.interpolationBuffer
+local bufferWriter = require(ReplicatedStorage.Modules.ByteNet.process.bufferWriter)
+local client       = require(ReplicatedStorage.Modules.ByteNet.process.client)
+
+------------------------------------------------------------
+-- CONFIG (reemplaza a library.flags)
+------------------------------------------------------------
+local Boo = { flags = {}, callbacks = {}, connections = {}, running = true }
+getgenv().BooLite = Boo
+
+local flags = Boo.flags
+-- Pickup
+flags.autopickup = false
+flags.autopickuprange = 40
+flags.autopickupdelay = 0
+flags.autopickuptargets = { "Gold" }      -- "All" o lista de nombres: {"Wood","Stone"}
+flags.autopickupchests = false
+-- Tp item chest
+flags.choosechest = false
+flags.autochestitems = false
+flags.autochesttargets = { "All" }
+-- Mine aura
+flags.resourceaura = false
+flags.resourceaurasize = 20   -- rango del Mine Aura (antes 5)
+flags.resourceauratargets = { "Critters", "Resources" }
+flags.resourceauraisolate = false
+flags.resourceauraface = false
+flags.resourceauraswing = false
+-- Auto eat
+flags.autoeat = false
+flags.autoeatthreshold = 1
+flags.autoeatitem = { "Bluefruit" }
+-- Auto farm
+flags.autofarm = false
+flags.autoharvest = false
+flags.autoplant = false
+flags.autofarmmove = false
+flags.autofarmrange = 125
+flags.autofarmcache = 3
+flags.autofarmmovespeed = 17
+flags.autoplantitem = { "Bluefruit" }
+-- Auto craft
+flags.autocraft = false
+flags.autocraftobject = "None"
+flags.autocraftuseamount = false
+flags.autocraftamount = 0
+flags.autocraftdelay = 0.05
+-- Auto campfire
+flags.autocampfire = false
+flags.autocampfirerange = 20
+flags.autocampfireitem = { "Leaves", "Log", "Wood" }
+flags.autocampfirethreshold = 250
+-- Item deletion
+flags.autodelete = false
+flags.autodeleterange = 25
+flags.autodeletetargets = { "Wood", "Log", "Stone", "Raw Iron" }  -- la lista en la captura estaba cortada ("Raw..."); agrega aquí el resto
+
+------------------------------------------------------------
+-- UTILIDADES
+------------------------------------------------------------
+local function notify(text, extra)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Boo Lite", Text = text .. (extra and (" " .. extra) or ""), Duration = 4,
+        })
+    end)
+    print("[BooLite]", text, extra or "")
+end
+
+local function ping()
+    return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 1000
+end
+
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(Boo.connections, c)
+    return c
+end
+
+local function toSet(v)
+    local set = {}
+    if type(v) == "string" then
+        set[v] = true
+    elseif type(v) == "table" then
+        for k, name in pairs(v) do
+            if type(name) == "string" then set[name] = true
+            elseif type(k) == "string" and name == true then set[k] = true end
+        end
+    end
+    return set
+end
+
+local function toList(v, valid)
+    local list = {}
+    if type(v) == "string" then
+        if valid(v) then table.insert(list, v) end
+    elseif type(v) == "table" then
+        for _, name in ipairs(v) do
+            if valid(name) then table.insert(list, name) end
+        end
+    end
+    return list
+end
+
+------------------------------------------------------------
+-- ESTADO
+------------------------------------------------------------
+local state = {
+    inventory = {},        -- nombre -> slot
+    inventorylist = {},
+    validitems = {},
+    chestitems = {},
+    checkeditems = {},
+    validmineaura = {},
+    checkedmineaura = {},
+    plantboxes = {},
+    plants = {},
+    lastChestItemInteract = {},
+    chestteleports = {},
+    tooltypes = {},
+    weapons = { "Rock", "War Hammer", "Mace", "Club", "Battle Axe", "Crystal Stick", "God Rock", "Emerald Blade" },
+}
+
+local flagsT = {            -- estados booleanos internos
+    eating = false,
+    crafting = false,
+    autoChestItemsRunning = false,
+    ismineauraing = false,
+    isplayinghitanim = false,
+}
+
+local timers = {
+    lastpickup = 0, lastresourceaura = 0, lastmineauracache = 0,
+    lasteatcheck = 0, lastautofarmcache = 0, lastautofarmmove = 0,
+    lastchestinteractcleanup = 0, lastcampfirecheck = 0,
+}
+
+local refs = {
+    chosenchest = nil, chesthighlight = nil,
+    autoeatIndex = nil, autoplantIndex = nil, autocampfireIndex = nil,
+    hitanim1 = nil, hitanim2 = nil,
+}
+
+local restPoint = nil
+do
+    local path = "Boo/games/" .. game.PlaceId .. "/restpoints/" .. localPlayer.UserId .. "/restpoint.txt"
+    if isfile and isfile(path) then
+        local x, y, z = readfile(path):match("([^,]+),%s*([^,]+),%s*([^,]+)")
+        x, y, z = tonumber(x), tonumber(y), tonumber(z)
+        if x and y and z then restPoint = Vector3.new(x, y, z) end
+    end
+end
+
+-- Tipos de herramienta (para la animación de swing)
+local toolFolder = game_:FindFirstChild("tool")
+for _, mod in ipairs(toolFolder:GetChildren()) do
+    state.tooltypes[mod.Name] = require(mod)
+end
+
+------------------------------------------------------------
+-- PACKETS
+------------------------------------------------------------
+-- Hook de sendReliable (igual que el script original)
+if hookfunction and not getgenv().sendReliable then
+    getgenv().sendReliable = hookfunction(client.sendReliable, function(a, b, c)
+        if not getgenv().BooLite then return getgenv().sendReliable(a, b, c) end
+        state.sendReliableTable = state.sendReliableTable
+            or { cursor = 0, size = 256, ready = true, buff = buffer.create(256) }
+        state.sendReliableTable = bufferWriter.load(state.sendReliableTable)
+        bufferWriter.alloc(1)
+        bufferWriter.u8(0)
+        bufferWriter.alloc(1)
+        bufferWriter.u8(a)
+        b(c)
+        state.sendReliableTable = bufferWriter.export()
+        return getgenv().sendReliable(a, b, c)
+    end)
+end
+
+local function firepacket(name, ...)
+    if not Packets[name] then return false end
+    local ok, err = pcall(function(...) Packets[name].send(...) end, ...)
+    if not ok then warn("packet failed:", name, err) return false end
+    return true
+end
+
+------------------------------------------------------------
+-- INVENTARIO
+------------------------------------------------------------
+local function updateinventory()
+    table.clear(state.inventory)
+    local ordered, list = {}, {}
+    local invList = localPlayer.PlayerGui.MainGui.RightPanel.Inventory.List
+    for _, child in ipairs(invList:GetChildren()) do
+        if child:IsA("GuiBase") then
+            state.inventory[child.Name] = child.LayoutOrder
+            table.insert(ordered, { item = child.Name, order = child.LayoutOrder })
+        end
+    end
+    table.sort(ordered, function(a, b) return a.order < b.order end)
+    for _, e in ipairs(ordered) do
+        if not e.item:find("Chest") then table.insert(list, e.item) end
+    end
+    state.inventorylist = list
+end
+updateinventory()
+
+Packets.ItemAdded.listen(function(d)
+    inventory.itemAdded(ItemIDS[d.itemID], d.quantity, d.index)
+    updateinventory()
+end)
+Packets.ItemChanged.listen(function(d)
+    inventory.itemChanged(d.key, d.quantity)
+    updateinventory()
+end)
+Packets.ItemRemoved.listen(function(d)
+    inventory.itemRemoved(d)
+    updateinventory()
 end)
 
+local function getinventoryquantity(name)
+    local slot = state.inventory[name]
+    if not slot then return 0 end
+    local item = GameUtil.Data.inventory[slot]
+    if not item or not item.quantity then return nil end
+    return tonumber(item.quantity) or 0
 end
+Boo.getQuantity = getinventoryquantity
 
--- ============================================================
--- 12z. ANTI-AFK
--- Evita la desconexion por inactividad (20 min). Activado por defecto.
--- ============================================================
-do
-    Settings.AntiAFK = true
-    if __ASTER_RUNTIME.antiAfkConn then
-        pcall(function() __ASTER_RUNTIME.antiAfkConn:Disconnect() end)
-        __ASTER_RUNTIME.antiAfkConn = nil
-    end
-    local function antiAfkPulse()
-        if not Settings.AntiAFK then return end
-        local VU = game:GetService("VirtualUser")
-        pcall(function()
-            VU:CaptureController()
-            VU:ClickButton2(Vector2.new(0, 0))
-        end)
-    end
-    __ASTER_RUNTIME.antiAfkConn = plr.Idled:Connect(antiAfkPulse)
-    -- respaldo: un pulso cada 5 minutos por si Idled no dispara
-    task.spawn(function()
-        while CURRENT_SESSION == __ASTER_RUNTIME.sessionId do
-            task.wait(300)
-            antiAfkPulse()
+------------------------------------------------------------
+-- ANIMACIÓN DE SWING
+------------------------------------------------------------
+local function playToolAnimation(toolData, hasSecondary)
+    local useType = toolData.useType
+    if useType and hasSecondary then
+        if flagsT.isplayinghitanim then
+            if refs.hitanim1 then refs.hitanim1:Stop() refs.hitanim1 = nil end
+            flagsT.isplayinghitanim = false
+            refs.hitanim2 = animations.playAnimation("LSlash")
+        else
+            if refs.hitanim2 then refs.hitanim2:Stop() refs.hitanim2 = nil end
+            flagsT.isplayinghitanim = true
+            refs.hitanim1 = animations.playAnimation("Slash")
         end
-    end)
-    ASTER.Tabs.Automation:AddToggle("Anti AFK", true, function(v)
-        Settings.AntiAFK = v == true
+    elseif useType then
+        animations.playAnimation(useType)
+    end
+end
+
+local function swingAnimation()
+    local tool = ItemData[GameUtil.Data.toolbar[GameUtil.Data.equipped].name]
+    if not tool or not tool.useType or not state.tooltypes[tool.useType] then return end
+    animations.stopCustomAnimations()
+    local speed = tool.speed
+    if not speed then return end
+    if statusEffects.playerHasEffect("Haste") and (tool.toolType == "Axe" or tool.toolType == "Pick") then
+        speed -= speed * 0.1
+    end
+    local now = Clock.getServerTime(true)
+    if speed <= now - GameUtil.Data.lastToolUse then
+        GameUtil.Data.lastToolUse = now
+        local sec = character.Tools:FindFirstChild("Secondary")
+        playToolAnimation(tool, sec and sec:FindFirstChild("ToolWeld2") and true or false)
+    end
+end
+
+------------------------------------------------------------
+-- ESCANEO DE ITEMS (Pickup / Deletion / Chest)
+------------------------------------------------------------
+local function scanItems()
+    table.clear(state.validitems)
+    table.clear(state.chestitems)
+    table.clear(state.checkeditems)
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.MaxParts = 1000
+    params.FilterDescendantsInstances = {
+        character, Workspace.Players, Workspace.Terrain,
+        Workspace.Resources, Workspace.Critters, Workspace.Rubble,
+    }
+
+    local parts = Workspace:GetPartBoundsInBox(character:GetPivot(), Vector3.new(50, 50, 50), params)
+    for i = 1, #parts do
+        local v = parts[i]
+        local model = v and v:FindFirstAncestorWhichIsA("Model")
+        local contents = v and v:FindFirstAncestor("Contents")
+
+        if not (v and v.Parent == Workspace.Items) then
+            if model and model.Parent == Workspace.Items then
+                v = model
+            elseif flags.autopickupchests and contents then
+                if v.Parent ~= contents then
+                    v = (model and model.Parent == contents) and model or nil
+                else
+                    v = v
+                end
+                if v then table.insert(state.chestitems, v) end
+                v = nil -- los items de cofre van a chestitems (usados por pickup)
+            else
+                v = nil
+            end
+        end
+
+        if v and not state.checkeditems[v] and v.Parent then
+            state.validitems[#state.validitems + 1] = v
+            state.checkeditems[v] = true
+        end
+    end
+end
+
+------------------------------------------------------------
+-- 1) PICK UP
+------------------------------------------------------------
+local function doPickup()
+    local targets = toSet(flags.autopickuptargets)
+
+    local function try(item)
+        local dist = (humanoidRootPart.Position - item:GetPivot().Position).Magnitude
+        if dist < flags.autopickuprange and functions.canBearLoad(item) then
+            if targets.All or targets[item.Name] then
+                if flags.autopickupdelay < tick() - timers.lastpickup then
+                    firepacket("Pickup", item:GetAttribute("EntityID"))
+                    timers.lastpickup = tick()
+                end
+            end
+        end
+    end
+
+    for _, item in pairs(state.validitems) do try(item) end
+    if flags.autopickupchests then
+        for _, item in pairs(state.chestitems) do try(item) end
+    end
+end
+
+------------------------------------------------------------
+-- 2) TP ITEM CHEST
+------------------------------------------------------------
+local function doChestItems()
+    local chest = refs.chosenchest and refs.chosenchest.model
+    if not chest or flagsT.autoChestItemsRunning then return end
+    flagsT.autoChestItemsRunning = true
+
+    task.spawn(function()
+        local hitbox = chest:FindFirstChild("Hitbox")
+        if not hitbox then flagsT.autoChestItemsRunning = false return end
+
+        local targets = toSet(flags.autochesttargets)
+
+        local function moveToChest(item)
+            if item and item.Parent and hitbox and hitbox.Parent then
+                if item:IsA("Model") then
+                    if item.PrimaryPart and not item.PrimaryPart.Anchored then
+                        item:PivotTo(hitbox.CFrame)
+                    end
+                elseif item:IsA("BasePart") and not item.Anchored then
+                    item:PivotTo(hitbox.CFrame)
+                end
+            end
+        end
+
+        for _, item in pairs(state.validitems) do
+            if item and item.Parent and (targets.All or targets[item.Name]) then
+                local id = item:GetAttribute("EntityID")
+                if id and not (state.lastChestItemInteract[id] and tick() - state.lastChestItemInteract[id] < 0.01) then
+                    if (humanoidRootPart.Position - item:GetPivot().Position).Magnitude <= 25 then
+                        state.lastChestItemInteract[id] = tick()
+
+                        local anchored =
+                            (item:IsA("Model") and item.PrimaryPart and item.PrimaryPart.Anchored)
+                            or (item:IsA("BasePart") and item.Anchored)
+
+                        if anchored then
+                            local last = state.chestteleports[item]
+                            if not (last and tick() - last > ping()) then
+                                firepacket("ForceInteract", id)
+                                state.chestteleports[item] = tick()
+                                task.wait(ping())
+                                state.chestteleports[item] = nil
+                                moveToChest(item)
+                            end
+                        else
+                            moveToChest(item)
+                        end
+                    end
+                end
+            end
+        end
+        flagsT.autoChestItemsRunning = false
     end)
 end
 
--- ============================================================
--- 13. AUTO-INICIO DE LA RUTA (ruta "5" cargada arriba)
--- ============================================================
-task.spawn(function()
-    if not (ASTER_CONFIG and ASTER_CONFIG.AutoStartRuta) then return end
-    task.wait(tonumber(ASTER_CONFIG.AutoStartDelay) or 6)
-    local tries = 0
-    while not (plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")) and tries < 60 do
-        tries = tries + 1
-        task.wait(0.5)
+-- Elegir el cofre con click
+connect(UserInputService.InputBegan, function(input, processed)
+    if processed or not flags.choosechest then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+    local target = mouse.Target
+    if input.UserInputType == Enum.UserInputType.Touch then
+        local ray = Workspace.CurrentCamera:ViewportPointToRay(input.Position.X, input.Position.Y)
+        local hit = Workspace:Raycast(ray.Origin, ray.Direction * 1000)
+        target = hit and hit.Instance
     end
-    if not Settings.recordedPositions or #Settings.recordedPositions == 0 then
-        warn("[ASTER] Auto-inicio: no hay ruta cargada")
+    if not target then return end
+
+    local model = target:FindFirstAncestorWhichIsA("Model")
+    if not model or (model.Name ~= "Reinforced Chest" and model.Name ~= "Chest") then return end
+
+    if refs.chosenchest then
+        if refs.chosenchest.highlight then refs.chosenchest.highlight:Destroy() end
+        if refs.chosenchest.model == model then
+            refs.chosenchest = nil
+            flags.choosechest = false
+            return
+        end
+    end
+
+    local hl = Instance.new("Highlight")
+    hl.Adornee = model
+    hl.Parent = model
+    hl.DepthMode = Enum.HighlightDepthMode.Occluded
+    hl.FillColor = Color3.fromRGB(255, 255, 255)
+    refs.chesthighlight = hl
+    refs.chosenchest = { model = model, highlight = hl }
+    flags.choosechest = false
+    notify("Cofre seleccionado", model.Name)
+end)
+
+------------------------------------------------------------
+-- 3) MINE AURA
+------------------------------------------------------------
+local function getresource()
+    local pos = humanoidRootPart.Position
+    local best, bestDist = nil, flags.resourceaurasize
+    for i = 1, #state.validmineaura do
+        local r = state.validmineaura[i]
+        if r and r.Parent then
+            local d = (r:GetPivot().Position - pos).Magnitude
+            if d <= bestDist then bestDist, best = d, r end
+        end
+    end
+    return best, bestDist
+end
+
+local function resourceaura(target)
+    if not target or not target.Parent then return end
+    if tick() - timers.lastresourceaura < 0.05 then return end
+
+    if flags.resourceauraswing then task.spawn(swingAnimation) end
+
+    local entities, seen = {}, {}
+    local function addmodel(model)
+        if not model or not model.Parent then return end
+        local id = model:GetAttribute("EntityID")
+        if not id then
+            for _, d in ipairs(model:GetDescendants()) do
+                id = d:GetAttribute("EntityID")
+                if id then break end
+            end
+        end
+        if not id or seen[id] then return end
+        local cid = model:IsDescendantOf(Workspace.Players) and model:GetAttribute("clientIdentifier")
+        local critter = cid and rendering.critters[cid]
+        entities[#entities + 1] = {
+            entityID = id,
+            buffer = critter and interpolationBuffer.getBuffer(critter.playerBuffer) or nil,
+        }
+        seen[id] = true
+    end
+
+    if flags.resourceauraisolate then
+        addmodel(target)
+    else
+        for i = 1, #state.validmineaura do addmodel(state.validmineaura[i]) end
+    end
+    if #entities <= 0 then return end
+
+    timers.lastresourceaura = tick()
+    firepacket("SwingTool", {
+        entityIDs = entities,
+        cframe = character:GetPivot(),
+        timestamp = Clock.getServerTime(true),
+    })
+end
+
+local function cacheMineAura()
+    table.clear(state.validmineaura)
+    table.clear(state.checkedmineaura)
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = { character, Workspace.Players, Workspace.Terrain, Workspace.Items }
+    for _, t in ipairs(CollectionService:GetTagged("Contents")) do table.insert(filter, t) end
+    params.FilterDescendantsInstances = filter
+
+    local s = flags.resourceaurasize * 2.5
+    local parts = Workspace:GetPartBoundsInBox(character:GetPivot(), Vector3.new(s, s, s), params)
+
+    local targets = flags.resourceauratargets
+    local function wants(name)
+        return targets == name or (type(targets) == "table" and table.find(targets, name))
+    end
+
+    for i = 1, #parts do
+        local model = parts[i]:FindFirstAncestorWhichIsA("Model")
+        if model and not state.checkedmineaura[model] and model.Parent and model:IsA("Model") then
+            local ok = false
+            if wants("Resources") then
+                if model.Parent == Workspace.Resources or model.Parent == Workspace:FindFirstChild("Mounds")
+                    or model.Name == "Gold Node" or model.Name == "Iron Node" or model.Name == "Coal Node"
+                    or model.Name == "Meteor Core" or model.Name == "Crystal Meteor Core"
+                    or model.Name == "Crystal Meteor Rock" or model.Name == "Magnetite Meteor Rock"
+                    or model.Name == "Small Rock" or model.Name == "Meteor Rock" then
+                    ok = true
+                end
+            end
+            if not ok and wants("Critters")    and model.Parent == Workspace.Critters    then ok = true end
+            if not ok and wants("Deployables") and model.Parent == Workspace.Deployables then ok = true end
+            if not ok and wants("Rubble")      and model.Parent == Workspace.Rubble      then ok = true end
+
+            if ok then
+                state.checkedmineaura[model] = true
+                state.validmineaura[#state.validmineaura + 1] = model
+            end
+        end
+    end
+end
+
+local function doMineAura()
+    -- herramienta equipada (arma, hacha o pico)
+    local tools = character.Tools:GetChildren()
+    local equipped
+    if #tools == 1 then
+        if tools[1]:IsA("Model") then equipped = tools[1] end
+    elseif #tools > 1 then
+        for _, t in ipairs(tools) do
+            if t:IsA("Model") and (table.find(state.weapons, t.Name) or t.Name:find("Axe") or t.Name:find("Pick")) then
+                equipped = t break
+            end
+        end
+    end
+    if not equipped then return end
+    if not (table.find(state.weapons, equipped.Name) or equipped.Name:find("Axe") or equipped.Name:find("Pick")) then return end
+
+    if #state.validmineaura > 0 then
+        local res = getresource()
+        if res then
+            if flags.resourceauraface then
+                local p = res:GetPivot().Position
+                character:PivotTo(CFrame.lookAt(humanoidRootPart.Position,
+                    Vector3.new(p.X, humanoidRootPart.Position.Y, p.Z)))
+            end
+            resourceaura(res)
+            flagsT.ismineauraing = true
+        else
+            flagsT.ismineauraing = false
+        end
+    else
+        flagsT.ismineauraing = false
+    end
+
+    if tick() - timers.lastmineauracache >= 0.1 then
+        timers.lastmineauracache = tick()
+        cacheMineAura()
+    end
+end
+
+------------------------------------------------------------
+-- 4) AUTO EAT
+------------------------------------------------------------
+local function autoEatLoop()
+    while Boo.running and flags.autoeat do
+        if tick() - timers.lasteatcheck >= 1 then
+            timers.lasteatcheck = tick()
+            if not flagsT.eating and GameUtil.Data.stats.food < flags.autoeatthreshold then
+                flagsT.eating = true
+                local list = toList(flags.autoeatitem, function(n) return ItemIDS[n] and state.inventory[n] end)
+                if #list > 0 then
+                    refs.autoeatIndex = (refs.autoeatIndex or 0) + 1
+                    if #list < refs.autoeatIndex then refs.autoeatIndex = 1 end
+                    local name = list[refs.autoeatIndex]
+                    while true do
+                        local slot = state.inventory[name]
+                        if not slot then break end
+                        firepacket("UseBagItem", slot)
+                        task.wait(ping())
+                        if not flags.autoeat or not Boo.running or GameUtil.Data.stats.food >= 100 then break end
+                    end
+                end
+                flagsT.eating = false
+            end
+        end
+        task.wait()
+    end
+    flagsT.eating = false
+end
+
+------------------------------------------------------------
+-- 5) AUTO PLANT + AUTO HARVEST
+------------------------------------------------------------
+local function refreshautofarmtable(list, isPlantBox)
+    for i = #list, 1, -1 do
+        local entry = list[i]
+        if not entry.Model or not entry.Model.Parent then
+            table.remove(list, i)
+        else
+            local pos
+            if isPlantBox then
+                local box = entry.Model:FindFirstChild("collisionBox")
+                if not box or entry.Model:FindFirstChild("Seed") then table.remove(list, i) continue end
+                pos = box.Position
+            else
+                pos = entry.Model:GetPivot().Position
+            end
+            entry.Position = pos
+            entry.Distance = (pos - humanoidRootPart.Position).Magnitude
+            if entry.Distance > flags.autofarmrange then table.remove(list, i) end
+        end
+    end
+    table.sort(list, function(a, b) return a.Distance < b.Distance end)
+end
+
+local function cacheautofarm()
+    timers.lastautofarmcache = tick()
+    table.clear(state.plantboxes)
+    table.clear(state.plants)
+
+    local seenBoxes, seenPlants = {}, {}
+
+    local canPlant = #toList(flags.autoplantitem, function(n) return ItemIDS[n] and state.inventory[n] end) > 0
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    local filter = { character, Workspace.Terrain, Workspace.Items, Workspace.Rubble,
+                     Workspace.Resources, Workspace.Players }
+    for _, t in ipairs(CollectionService:GetTagged("Contents")) do table.insert(filter, t) end
+    params.FilterDescendantsInstances = filter
+
+    local range = flags.autofarmrange
+    local center = CFrame.new(character:GetPivot().Position) - (Vector3.new(0, humanoid.HipHeight, 0) + Vector3.new(0, 2, 0))
+    local parts = Workspace:GetPartBoundsInBox(center, Vector3.new(range * 2, 15, range * 2), params)
+
+    for _, part in ipairs(parts) do
+        local model = part:FindFirstAncestorWhichIsA("Model")
+        if model then
+            if flags.autoplant and canPlant and model.Parent == Workspace.Deployables then
+                if model.Name == "Plant Box" and model:FindFirstChild("collisionBox")
+                    and not model:FindFirstChild("Seed") and not seenBoxes[model] then
+                    local pos = model.collisionBox.Position
+                    local dist = (pos - humanoidRootPart.Position).Magnitude
+                    if dist <= range then
+                        seenBoxes[model] = true
+                        table.insert(state.plantboxes, { Model = model, Position = pos, Distance = dist })
+                    end
+                end
+            end
+
+            if flags.autoharvest and not seenPlants[model]
+                and model.Parent ~= Workspace.Resources and model.Parent ~= Workspace.Critters
+                and model.Parent ~= Workspace.Deployables and model.Parent ~= Workspace.Rubble
+                and model.Name ~= "Plant Box" then
+                local n = string.lower(model.Name)
+                if n:find("bush", 1, true) or n:find("tree", 1, true)
+                    or n:find("crop", 1, true) or n:find("cacti", 1, true) then
+                    local pos = model:GetPivot().Position
+                    local dist = (pos - humanoidRootPart.Position).Magnitude
+                    if dist <= range then
+                        seenPlants[model] = true
+                        table.insert(state.plants, { Model = model, Position = pos, Distance = dist })
+                    end
+                end
+            end
+        end
+    end
+
+    refreshautofarmtable(state.plantboxes, true)
+    refreshautofarmtable(state.plants, false)
+end
+
+local function autoFarmLoop()
+    cacheautofarm()
+    timers.lastautofarmmove = tick()
+
+    while Boo.running and flags.autofarm do
+        if flags.autofarmcache <= tick() - timers.lastautofarmcache then
+            cacheautofarm()
+        end
+
+        -- mover
+        task.spawn(function()
+            if not flags.autofarmmove then timers.lastautofarmmove = tick() return end
+            local pos
+            local box = flags.autoplant and state.plantboxes[1] and state.plantboxes[1].Model
+            if box and box:FindFirstChild("collisionBox") then pos = box.collisionBox.Position end
+            if not pos and flags.autoharvest and state.plants[1] and state.plants[1].Model
+                and state.plants[1].Model.Parent then
+                pos = state.plants[1].Model:GetPivot().Position
+            end
+            if not pos and restPoint then pos = restPoint end
+
+            if pos then
+                local goal = pos + Vector3.new(0, 3, 0)
+                local cur = humanoidRootPart.Position
+                local diff = goal - cur
+                local mag = diff.Magnitude
+                if mag > 0.1 then
+                    local now = tick()
+                    local step = math.min(flags.autofarmmovespeed * math.clamp(now - timers.lastautofarmmove, 0, 1/30), mag)
+                    humanoidRootPart.CFrame = CFrame.new(cur + diff.Unit * step)
+                    timers.lastautofarmmove = now
+                else
+                    humanoidRootPart.CFrame = CFrame.new(goal)
+                    timers.lastautofarmmove = tick()
+                end
+            else
+                timers.lastautofarmmove = tick()
+            end
+        end)
+
+        -- cosechar
+        task.spawn(function()
+            if flags.autoharvest and #state.plants > 0 then
+                for i = 1, #state.plants do
+                    local p = state.plants[i]
+                    if p and p.Model and p.Model.Parent then
+                        if (p.Model:GetPivot().Position - humanoidRootPart.Position).Magnitude <= 25 then
+                            firepacket("Pickup", p.Model:GetAttribute("EntityID"))
+                            table.remove(state.plants, i)
+                            refreshautofarmtable(state.plants, false)
+                            return
+                        end
+                    else
+                        table.remove(state.plants, i)
+                        refreshautofarmtable(state.plants, false)
+                        return
+                    end
+                end
+            end
+        end)
+
+        -- plantar
+        task.spawn(function()
+            if flags.autoplant and #state.plantboxes > 0 then
+                local found, idx
+                for i = 1, #state.plantboxes do
+                    local b = state.plantboxes[i]
+                    if b and b.Model and b.Model.Parent and b.Model:FindFirstChild("collisionBox") then
+                        if (b.Model.collisionBox.Position - humanoidRootPart.Position).Magnitude <= 25 then
+                            found, idx = b, i
+                            break
+                        end
+                    else
+                        table.remove(state.plantboxes, i)
+                        refreshautofarmtable(state.plantboxes, true)
+                        return
+                    end
+                end
+
+                if found then
+                    local list = toList(flags.autoplantitem, function(n) return ItemIDS[n] and state.inventory[n] end)
+                    if #list > 0 then
+                        refs.autoplantIndex = (refs.autoplantIndex or 0) + 1
+                        if #list < refs.autoplantIndex then refs.autoplantIndex = 1 end
+                        local name = list[refs.autoplantIndex]
+                        if not found.Model:FindFirstChild("Seed") then
+                            firepacket("InteractStructure", {
+                                entityID = found.Model:GetAttribute("EntityID"),
+                                itemID = ItemIDS[name],
+                            })
+                        else
+                            table.remove(state.plantboxes, idx)
+                            refreshautofarmtable(state.plantboxes, true)
+                        end
+                    end
+                end
+            end
+        end)
+
+        task.wait()
+    end
+end
+
+function Boo.setRestPoint()
+    restPoint = character:GetPivot().Position
+    if makefolder and writefile then
+        local base = "Boo/games/" .. game.PlaceId .. "/restpoints/" .. localPlayer.UserId
+        local acc = ""
+        for part in string.gmatch(base, "[^/]+") do
+            acc = acc == "" and part or acc .. "/" .. part
+            if not isfolder(acc) then makefolder(acc) end
+        end
+        writefile(base .. "/restpoint.txt", restPoint.X .. ", " .. restPoint.Y .. ", " .. restPoint.Z)
+    end
+    notify("Rest point guardado")
+end
+
+------------------------------------------------------------
+-- 6) AUTO CRAFT
+------------------------------------------------------------
+local function autoCraft()
+    if flagsT.crafting then return end
+
+    if flags.autocraftuseamount then
+        local amount = tonumber(flags.autocraftamount)
+        if not amount or amount <= 0 then flags.autocraft = false return end
+
+        local itemName = flags.autocraftobject
+        if not ItemIDS[itemName] then notify("Item inválido") flags.autocraft = false return end
+
+        flagsT.crafting = true
+        local start = getinventoryquantity(itemName)
+        if not start then flagsT.crafting = false flags.autocraft = false return end
+
+        local goal, current = start + amount, start
+        while current < goal and Boo.running do
+            if not GameUtil.canCraftItem(itemName, nil, true) then
+                if flags.autocraftdelay > 0 then task.wait(flags.autocraftdelay) else task.wait() end
+                current = getinventoryquantity(itemName) or 0
+                if not flags.autocraft then flagsT.crafting = false return end
+                continue
+            end
+            if not flags.autocraft then flagsT.crafting = false return end
+
+            local before = current
+            firepacket("CraftItem", ItemIDS[itemName])
+            if flags.autocraftdelay > 0 then task.wait(flags.autocraftdelay) end
+
+            local t0 = tick()
+            while true do
+                current = getinventoryquantity(itemName) or 0
+                task.wait()
+                if not flags.autocraft or current ~= before or tick() - t0 >= 3 then break end
+            end
+        end
+
+        if flags.autocraft then
+            notify("Crafteo terminado", itemName .. " x" .. math.max(current - start, 0))
+        end
+        flagsT.crafting = false
+        flags.autocraft = false
+    else
+        flagsT.crafting = true
+        while Boo.running and flags.autocraft do
+            local itemName = flags.autocraftobject
+            if not ItemIDS[itemName] then
+                notify("Item inválido")
+                flags.autocraft = false
+                break
+            end
+            if GameUtil.canCraftItem(itemName, nil, true) then
+                firepacket("CraftItem", ItemIDS[itemName])
+            end
+            if flags.autocraftdelay > 0 then task.wait(flags.autocraftdelay) else task.wait() end
+        end
+        flagsT.crafting = false
+    end
+end
+
+------------------------------------------------------------
+-- 8) AUTO CAMPFIRE
+------------------------------------------------------------
+local function campfireValue(fire)
+    local ok, v = pcall(function()
+        return tonumber(fire.Board.Billboard.Backdrop.TextLabel.Text)
+    end)
+    return ok and v or nil
+end
+
+local function feedCampfire(fire)
+    local list = toList(flags.autocampfireitem, function(n) return ItemIDS[n] and state.inventory[n] end)
+    if #list == 0 then return end
+    while Boo.running and flags.autocampfire and fire.Parent do
+        local value = campfireValue(fire)
+        if not value or value >= flags.autocampfirethreshold then break end
+        -- recalcular por si se acabó algún item
+        list = toList(flags.autocampfireitem, function(n) return ItemIDS[n] and state.inventory[n] end)
+        if #list == 0 then break end
+        refs.autocampfireIndex = (refs.autocampfireIndex or 0) + 1
+        if #list < refs.autocampfireIndex then refs.autocampfireIndex = 1 end
+        local name = list[refs.autocampfireIndex]
+        firepacket("InteractStructure", { entityID = fire:GetAttribute("EntityID"), itemID = ItemIDS[name] })
+        task.wait(ping())
+    end
+end
+
+local function autoCampfireLoop()
+    while Boo.running and flags.autocampfire do
+        if tick() - timers.lastcampfirecheck >= 1 then
+            timers.lastcampfirecheck = tick()
+            task.spawn(function()
+                for _, child in ipairs(Workspace.Deployables:GetChildren()) do
+                    if child.Name == "Campfire" and humanoidRootPart then
+                        local dist = (child:GetPivot().Position - humanoidRootPart.Position).Magnitude
+                        if dist <= flags.autocampfirerange then
+                            local value = campfireValue(child)
+                            if value and value < flags.autocampfirethreshold then
+                                feedCampfire(child)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+        task.wait()
+    end
+end
+
+------------------------------------------------------------
+-- 7) ITEM DELETION
+------------------------------------------------------------
+local function doDelete()
+    local targets = toSet(flags.autodeletetargets)
+    for k, item in pairs(state.validitems) do
+        if item and item.Parent then
+            local dist = (humanoidRootPart.Position - item:GetPivot().Position).Magnitude
+            if dist < flags.autodeleterange and (targets.All or targets[item.Name]) then
+                item:Destroy() -- solo local
+                state.validitems[k] = nil
+                state.checkeditems[item] = nil
+            end
+        end
+    end
+end
+
+------------------------------------------------------------
+-- LOOPS PRINCIPALES
+------------------------------------------------------------
+connect(RunService.Heartbeat, function()
+    if not character or not character.Parent then return end
+    if not humanoid or humanoid.Health <= 0 then return end
+    if not humanoidRootPart or not humanoidRootPart.Parent then return end
+    if not localPlayer:GetAttribute("hasSpawned") then return end
+
+    if flags.autopickup or flags.autodelete or flags.autochestitems then
+        scanItems()
+    end
+
+    if flags.autodelete then doDelete() end
+    if flags.autochestitems then doChestItems() end
+    if flags.autopickup then doPickup() end
+
+    -- limpieza de cooldowns del cofre
+    if tick() - timers.lastchestinteractcleanup >= 30 then
+        timers.lastchestinteractcleanup = tick()
+        local cutoff = tick() - 10
+        for k, v in pairs(state.lastChestItemInteract) do
+            if v < cutoff then state.lastChestItemInteract[k] = nil end
+        end
+    end
+end)
+
+connect(RunService.RenderStepped, function()
+    if not character or not character.Parent then return end
+    if not humanoid or humanoid.Health <= 0 then return end
+    if not humanoidRootPart or not humanoidRootPart.Parent then return end
+    if not localPlayer:GetAttribute("hasSpawned") then return end
+
+    if flags.resourceaura then
+        doMineAura()
+    else
+        flagsT.ismineauraing = false
+    end
+end)
+
+-- Personaje nuevo al morir
+connect(localPlayer.CharacterAdded, function(char)
+    character = char
+    humanoid = char:WaitForChild("Humanoid")
+    humanoidRootPart = char:WaitForChild("HumanoidRootPart")
+    flagsT.eating = false
+end)
+
+------------------------------------------------------------
+-- API
+------------------------------------------------------------
+-- Callbacks que arrancan loops al prender el flag
+Boo.callbacks.autoeat = function(on) if on then task.spawn(autoEatLoop) end end
+Boo.callbacks.autofarm = function(on) if on then task.spawn(autoFarmLoop) end end
+Boo.callbacks.autocraft = function(on) if on then task.spawn(autoCraft) end end
+Boo.callbacks.autocampfire = function(on) if on then task.spawn(autoCampfireLoop) end end
+
+function Boo.set(name, value)
+    if flags[name] == nil then warn("flag inexistente:", name) return end
+    flags[name] = value
+    if Boo.callbacks[name] then Boo.callbacks[name](value) end
+end
+
+function Boo.unload()
+    Boo.running = false
+    for k, v in pairs(flags) do
+        if type(v) == "boolean" then flags[k] = false end
+    end
+    for _, c in ipairs(Boo.connections) do pcall(function() c:Disconnect() end) end
+    table.clear(Boo.connections)
+    if refs.chosenchest and refs.chosenchest.highlight then refs.chosenchest.highlight:Destroy() end
+    getgenv().BooLite = nil
+end
+
+
+notify("Boo Lite cargado")
+return Boo
+end
+
+task.spawn(function()
+    local okB, Boo = pcall(loadBoo)
+    if not okB or type(Boo) ~= "table" then
+        warn("[Hub] Boo Lite: " .. tostring(Boo))
+        TabBoo:AddLabel("Error: " .. tostring(Boo))
         return
     end
-    if Settings.GoldCircuitEnabled then return end
-    pcall(function()
-        local reg = Window and Window.ElementRegistry and Window.ElementRegistry["Start Tween"]
-        if reg and reg.SetValue then reg.SetValue(true) end
+    local flags = Boo.flags
+    local syncs = {}
+
+    -- Config por defecto (según tus capturas): toggles que arrancan en ON
+    for _, name in ipairs({
+        "autopickup", "autopickupchests", "resourceaura", "autoeat",
+        "autofarm", "autoharvest", "autoplant", "autocampfire",
+        "autodelete", "autochestitems",
+    }) do
+        Boo.set(name, true)
+    end
+    -- OFF por defecto: autofarmmove, resourceauraswing, choosechest
+    flags.autopickupdelay = 0   -- delay del pickup en 0
+
+    local function bToggle(label, flag)
+        local reg = TabBoo:AddToggle(label, flags[flag], function(v) Boo.set(flag, v) end)
+        syncs[#syncs + 1] = function() reg.SetValue(flags[flag]) end
+    end
+
+    local function bBox(label, flag, kind)
+        local cur = flags[flag]
+        local txt = type(cur) == "table" and table.concat(cur, ", ") or tostring(cur)
+        TabBoo:AddInput(label, txt, function(t)
+            if t == "" then return end
+            if kind == "number" then
+                local n = tonumber(t)
+                if n then flags[flag] = n end
+            elseif kind == "list" then
+                local list = {}
+                for name in string.gmatch(t, "[^,]+") do
+                    list[#list + 1] = (name:gsub("^%s+", ""):gsub("%s+$", ""))
+                end
+                flags[flag] = list
+            else
+                flags[flag] = t
+            end
+        end)
+    end
+
+    bToggle("Pickup Aura", "autopickup")
+    bBox("Pickup range", "autopickuprange", "number")
+    bBox("Pickup items (Wood, Stone / All)", "autopickuptargets", "list")
+    bToggle("Pickup chest items", "autopickupchests")
+    bToggle("Mine Aura", "resourceaura")
+    bBox("Mine range", "resourceaurasize", "number")
+    bToggle("Mine swing anim", "resourceauraswing")
+    bToggle("Auto Eat", "autoeat")
+    bBox("Eat threshold", "autoeatthreshold", "number")
+    bBox("Eat items (Bloodfruit, Apple)", "autoeatitem", "list")
+    bToggle("Auto Farm", "autofarm")
+    bToggle("Auto Harvest", "autoharvest")
+    bToggle("Auto Plant", "autoplant")
+    bToggle("Auto Move", "autofarmmove")
+    bBox("Plant items (Bloodfruit, Berry)", "autoplantitem", "list")
+    bBox("Farm range", "autofarmrange", "number")
+    bToggle("Auto Campfire", "autocampfire")
+    bBox("Campfire range", "autocampfirerange", "number")
+    bBox("Campfire items (Leaves, Wood, Log, Coal)", "autocampfireitem", "list")
+    bBox("Campfire threshold (50-250)", "autocampfirethreshold", "number")
+    bToggle("Item Deletion", "autodelete")
+    bBox("Delete range", "autodeleterange", "number")
+    bBox("Delete items (Leaves, Sand)", "autodeletetargets", "list")
+    bToggle("Select Chest (click chest)", "choosechest")
+    bToggle("Auto Insert Items (chest)", "autochestitems")
+    bBox("Chest items (Wood / All)", "autochesttargets", "list")
+    bToggle("Auto Craft", "autocraft")
+    bBox("Craft item (ej: Steel)", "autocraftobject", "text")
+    bToggle("Craft usa cantidad", "autocraftuseamount")
+    bBox("Craft cantidad", "autocraftamount", "number")
+    TabBoo:AddButton("Set Rest Point", Boo.setRestPoint)
+
+    table.insert(Hub.OnClose, function()
+        local b = getgenv and getgenv().BooLite
+        if b and b.unload then b.unload() end
     end)
-    Settings.GoldCircuitEnabled = true
-    startGoldCircuit()
-    print("[ASTER] Ruta iniciada automaticamente (" .. #Settings.recordedPositions .. " puntos)")
+
+    -- mantiene los toggles de la ventana sincronizados con los flags
+    while Boo.running do
+        for _, refresh in ipairs(syncs) do refresh() end
+        task.wait(0.25)
+    end
+end)
+
+
+--========================================================================
+-- PESTAÑA 3: AUTO EQUIP (autoequip_autoexec.lua, sin autoarranque propio)
+--========================================================================
+local function loadAutoEquip()
+
+-- AutoEquip (versión AUTOEXEC): hoe si hay Plant Box cerca, pico si no.
+-- Poné este archivo en la carpeta autoexec. Se inicia solo al entrar al juego.
+
+-- Esperar a que cargue el juego ANTES de buscar ByteNetReliable y los módulos
+if not game:IsLoaded() then game.Loaded:Wait() end
+task.wait(2)
+
+-- AutoEquipTool (extraído del script, versión independiente)
+-- Uso:
+--   local AutoEquip = loadstring(readfile("autoequiptool.lua"))()
+--   AutoEquip.equip("Shovel")            -- equipa una vez
+--   AutoEquip.start("Stone Pickaxe")     -- mantiene la herramienta equipada
+--   AutoEquip.stop()
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local plr = Players.LocalPlayer
+
+local AutoEquip = {}
+local running = false
+
+-- [ ByteNetReliable ] --
+local ByteNetReliable = ReplicatedStorage:FindFirstChild("ByteNetReliable")
+    or ReplicatedStorage:WaitForChild("ByteNetReliable", 5)
+if not ByteNetReliable then
+    for _, v in ipairs(ReplicatedStorage:GetDescendants()) do
+        if v.Name == "ByteNetReliable" and v:IsA("RemoteEvent") then
+            ByteNetReliable = v
+            break
+        end
+    end
+end
+
+-- [ Packet IDs: se descubren en vivo desde Modules.Packets ] --
+local PACKET_IDS = {}
+
+local function readPacketObjectId(obj)
+    if type(obj) ~= "table" then return nil end
+    for _, key in ipairs({ "id", "Id", "_id", "packetId", "packetID", "ID" }) do
+        local v = obj[key]
+        if type(v) == "number" and v == v and v > 0 then return v end
+    end
+    return nil
+end
+
+local function discoverPacketIds()
+    local modules = ReplicatedStorage:FindFirstChild("Modules") or ReplicatedStorage:WaitForChild("Modules", 10)
+    local packetsInst = modules and (modules:FindFirstChild("Packets") or modules:WaitForChild("Packets", 10))
+    if not packetsInst then return end
+    local ok, gamePackets = pcall(require, packetsInst)
+    if not ok or type(gamePackets) ~= "table" then return end
+
+    for name, obj in pairs(gamePackets) do
+        local id = readPacketObjectId(obj)
+        if type(name) == "string" and id then PACKET_IDS[name] = id end
+    end
+
+    -- Respaldo: buscar el ID en la tabla packetIDs de ByteNet
+    local byteNet = modules:FindFirstChild("ByteNet")
+    local folder = byteNet and byteNet:FindFirstChild("packets")
+    local idsInst = (folder and (folder:FindFirstChild("packetIDs") or folder:FindFirstChild("packetIds")))
+        or (byteNet and (byteNet:FindFirstChild("packetIDs") or byteNet:FindFirstChild("packetIds")))
+        or modules:FindFirstChild("packetIDs")
+    if idsInst then
+        local okIds, packetIDs = pcall(require, idsInst)
+        if okIds and type(packetIDs) == "table" then
+            for name, obj in pairs(gamePackets) do
+                if not PACKET_IDS[name] then
+                    for id, reg in pairs(packetIDs) do
+                        if type(id) == "number" and reg == obj then PACKET_IDS[name] = id break end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function getPacketId(name)
+    if next(PACKET_IDS) == nil then pcall(discoverPacketIds) end
+    return PACKET_IDS[name]
+end
+
+-- [ Lógica de equip ] --
+local function getToolSlot(toolName)
+    local GameUtil
+    pcall(function() GameUtil = require(ReplicatedStorage.Modules.GameUtil) end)
+    local toolbar = GameUtil and GameUtil.Data and GameUtil.Data.toolbar
+    if not toolbar then return nil end
+    for i = 1, 6 do
+        if toolbar[i] and toolbar[i].name == toolName then return i end
+    end
+    return nil
+end
+
+local function fallbackEquip(name)
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local tool = plr.Backpack and plr.Backpack:FindFirstChild(name)
+    if hum and tool then hum:EquipTool(tool) end
+end
+
+function AutoEquip.equip(name)
+    if not ByteNetReliable then return fallbackEquip(name) end
+    local slot = getToolSlot(name)
+    local packetId = getPacketId("EquipTool")
+    if slot and packetId then
+        local b = buffer.create(4)
+        buffer.writeu8(b, 0, 0)          -- header
+        buffer.writeu8(b, 1, packetId)   -- ID del paquete EquipTool
+        buffer.writeu16(b, 2, slot)      -- slot del toolbar
+        ByteNetReliable:FireServer(b)
+    else
+        fallbackEquip(name)
+    end
+end
+
+function AutoEquip.isEquipped(name)
+    local players = workspace:FindFirstChild("Players")
+    local folder = players and players:FindFirstChild(plr.Name)
+    local tools = folder and folder:FindFirstChild("Tools")
+    if tools and tools:FindFirstChild(name) then return true end
+    return plr.Character ~= nil and plr.Character:FindFirstChild(name) ~= nil
+end
+
+function AutoEquip.isAnyEquipped()
+    local players = workspace:FindFirstChild("Players")
+    local folder = players and players:FindFirstChild(plr.Name)
+    local tools = folder and folder:FindFirstChild("Tools")
+    if tools and #tools:GetChildren() > 0 then return true end
+    return plr.Character ~= nil and plr.Character:FindFirstChildOfClass("Tool") ~= nil
+end
+
+-- Mantiene la herramienta equipada (el script original llama a startGoldEquipManager,
+-- pero esa función no está definida en el archivo, así que este loop es una versión simple).
+function AutoEquip.start(name, interval)
+    if running then return end
+    running = true
+    task.spawn(function()
+        while running do
+            if not AutoEquip.isEquipped(name) then AutoEquip.equip(name) end
+            task.wait(interval or 0.5)
+        end
+    end)
+end
+
+function AutoEquip.stop() running = false end
+
+-- Diagnóstico: AutoEquip.debug("Shovel") e imprime en qué paso falla
+function AutoEquip.debug(name)
+    print("[AutoEquip] ByteNetReliable:", ByteNetReliable and ByteNetReliable:GetFullName() or "NO ENCONTRADO")
+    local m = ReplicatedStorage:FindFirstChild("Modules")
+    print("[AutoEquip] Modules:", m and "ok" or "NO ENCONTRADO")
+    print("[AutoEquip] Modules.Packets:", (m and m:FindFirstChild("Packets")) and "ok" or "NO ENCONTRADO")
+    local okD, errD = pcall(discoverPacketIds)
+    print("[AutoEquip] discoverPacketIds:", okD and "ok" or errD)
+    local count = 0
+    for _ in pairs(PACKET_IDS) do count += 1 end
+    print("[AutoEquip] paquetes encontrados:", count)
+    print("[AutoEquip] ID de EquipTool:", PACKET_IDS["EquipTool"])
+    print("[AutoEquip] slot de '" .. tostring(name) .. "':", getToolSlot(name))
+    local GameUtil
+    local okG, errG = pcall(function() GameUtil = require(ReplicatedStorage.Modules.GameUtil) end)
+    print("[AutoEquip] GameUtil:", okG and "ok" or errG)
+    if GameUtil and GameUtil.Data and GameUtil.Data.toolbar then
+        for i = 1, 6 do
+            local t = GameUtil.Data.toolbar[i]
+            print("  slot", i, t and t.name or "(vacío)")
+        end
+    end
+    print("[AutoEquip] equipada ahora:", AutoEquip.isEquipped(name))
+end
+
+-- [ Modo inteligente: hoe si hay Plant Box cerca, pico si no ] --
+local PICK_PRIORITY = { "God Pick", "Void Pick", "Pink Diamond Pick", "Emerald Pick" }
+
+local function toolNames()
+    local names, seen = {}, {}
+    local function add(n)
+        if n and not seen[n] then seen[n] = true table.insert(names, n) end
+    end
+    local GameUtil
+    pcall(function() GameUtil = require(ReplicatedStorage.Modules.GameUtil) end)
+    local toolbar = GameUtil and GameUtil.Data and GameUtil.Data.toolbar
+    if toolbar then
+        for i = 1, 6 do if toolbar[i] then add(toolbar[i].name) end end
+    end
+    if plr.Backpack then for _, t in ipairs(plr.Backpack:GetChildren()) do add(t.Name) end end
+    if plr.Character then
+        for _, t in ipairs(plr.Character:GetChildren()) do if t:IsA("Tool") then add(t.Name) end end
+    end
+    return names
+end
+
+-- Hoe: la que digas, o la primera que tenga "hoe" (prefiere la de "crystal")
+local function resolveHoe(custom)
+    local names = toolNames()
+    if custom then return custom end
+    local any
+    for _, n in ipairs(names) do
+        local l = n:lower()
+        if l:find("hoe", 1, true) then
+            if l:find("crystal", 1, true) then return n end
+            any = any or n
+        end
+    end
+    return any
+end
+
+-- Pico: el que digas, o el mejor de la lista de prioridad, o cualquiera con "pick"
+local function resolvePick(custom)
+    if custom then return custom end
+    local names = toolNames()
+    local set = {}
+    for _, n in ipairs(names) do set[n] = true end
+    for _, n in ipairs(PICK_PRIORITY) do if set[n] then return n end end
+    for _, n in ipairs(names) do
+        if n:lower():find("pick", 1, true) then return n end
+    end
+    return nil
+end
+
+local function plantBoxNearby(range)
+    local hrp = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+    local deployables = workspace:FindFirstChild("Deployables")
+    if not hrp or not deployables then return false end
+    local rangeSq = range * range
+    for _, model in ipairs(deployables:GetChildren()) do
+        if model.Name:lower():find("plant box", 1, true) then
+            local part = model:IsA("Model") and (model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true))
+                or (model:IsA("BasePart") and model)
+            if part then
+                local d = hrp.Position - part.Position
+                if d.X * d.X + d.Y * d.Y + d.Z * d.Z <= rangeSq then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- opts: { hoe = "Nombre exacto" (opcional), pick = "Nombre exacto" (opcional),
+--         range = 25, interval = 0.3, verbose = true }
+function AutoEquip.startSmart(opts)
+    opts = opts or {}
+    if running then return end
+    running = true
+    local range = opts.range or 25
+    local last
+    task.spawn(function()
+        while running do
+            local wantHoe = plantBoxNearby(range)
+            local target = wantHoe and resolveHoe(opts.hoe) or resolvePick(opts.pick)
+            if target then
+                if opts.verbose ~= false and target ~= last then
+                    print("[AutoEquip] " .. (wantHoe and "Plant Box cerca -> " or "Sin Plant Box -> ") .. target)
+                    last = target
+                end
+                if not AutoEquip.isEquipped(target) then AutoEquip.equip(target) end
+            elseif opts.verbose ~= false and last ~= "none" then
+                warn("[AutoEquip] No encontré " .. (wantHoe and "ninguna hoe" or "ningún pico") .. " en tu inventario")
+                last = "none"
+            end
+            task.wait(opts.interval or 0.3)
+        end
+    end)
+end
+
+
+local env = (getgenv and getgenv()) or _G
+if env.__AUTOEQUIP_RUNNING then
+    pcall(function() env.__AUTOEQUIP_RUNNING.stop() end)
+end
+env.__AUTOEQUIP_RUNNING = AutoEquip
+return AutoEquip
+end
+
+task.spawn(function()
+    local okE, AE = pcall(loadAutoEquip)
+    if not okE or type(AE) ~= "table" then
+        warn("[Hub] AutoEquip: " .. tostring(AE))
+        TabEquip:AddLabel("Error: " .. tostring(AE))
+        return
+    end
+    local LPlayer = game:GetService("Players").LocalPlayer
+    local cfg = { enabled = true, hoe = nil, pick = nil, range = 25 }
+    local gen = 0
+
+    -- reinicia el modo inteligente con la config actual (hoe si hay Plant Box cerca, pico si no)
+    local function apply()
+        gen = gen + 1
+        local my = gen
+        AE.stop()
+        task.delay(0.5, function()
+            if my ~= gen or not cfg.enabled then return end
+            AE.startSmart({ hoe = cfg.hoe, pick = cfg.pick, range = cfg.range })
+        end)
+    end
+
+    TabEquip:AddLabel("Auto Equip (hoe / pico)")
+    TabEquip:AddToggle("Smart Equip", true, function(v) cfg.enabled = v apply() end)
+    TabEquip:AddInput("Hoe (vacío = auto)", "", function(t)
+        cfg.hoe = (t ~= "" and t) or nil
+        apply()
+    end)
+    TabEquip:AddInput("Pico (vacío = auto)", "", function(t)
+        cfg.pick = (t ~= "" and t) or nil
+        apply()
+    end)
+    TabEquip:AddSlider("Rango Plant Box", 5, 100, 25, 1, function(v)
+        cfg.range = v
+        apply()
+    end)
+
+    table.insert(Hub.OnClose, function()
+        cfg.enabled = false
+        gen = gen + 1
+        AE.stop()
+    end)
+
+    -- arranque automático (igual que la versión autoexec)
+    repeat task.wait(0.5) until LPlayer.Character and LPlayer.Character:FindFirstChild("HumanoidRootPart")
+    task.wait(3)
+    apply()
+end)
+
+
+-- Al cerrar la ventana (X) se apaga todo
+table.insert(Hub.OnClose, function()
+    pcall(function()
+        if Settings then Settings.recordingPath = false end
+        if stopGoldCircuit then stopGoldCircuit() end
+        if Settings then Settings.GoldVisual = false end
+        if updateVisualNodes then updateVisualNodes() end
+        local rt = getgenv().__ASTER_RUNTIME
+        if type(rt) == "table" then rt.sessionId = (rt.sessionId or 0) + 1 end
+    end)
 end)
